@@ -1,0 +1,56 @@
+bitbrowser:
+  api: http://127.0.0.1:54345
+  profile_id: 4d9cb054110f45a6813666567e12a591
+publish:
+  daily_count: 2
+  minimize_browser: false
+  force_viewport: true
+  viewport_width: 1920
+  viewport_height: 1080
+  content_check_timeout: 180
+  content_check_poll_interval: 10
+  interval_seconds_min: 20
+  interval_seconds_max: 40
+  max_replace_attempts: 3
+  dry_run: false
+  upload_url: https://www.tiktok.com/tiktokstudio/upload?from=creator_center
+  product_display_name: 小黄车下单
+paths:
+  videos_dir: C:/Users/Administrator/Desktop/泰国视频（品名）
+  mapping_file: data/product_video_map.json
+  accounts_file: data/accounts.yaml
+  excel_file: C:/Users/Administrator/Desktop/泰国(1).xlsx
+  state_file: data/publish_state.json
+  log_dir: logs
+poll:
+  posts_per_account: 1
+  rounds_per_day: 2
+  per_ip_group: 5
+  parallel_ips: false
+  max_parallel_ips: 0
+  account_cooldown_seconds: 21600
+  ip_group_cooldown_seconds: 600
+  cooldown_jitter_seconds: 60
+  skip_cooling_accounts: true
+  precheck_proxy: true
+  skip_bad_proxy_accounts: true
+  account_interval_seconds: 600
+  account_interval_jitter: 60
+  history_days: 2
+  similarity_threshold: 0.5
+  close_browser_after_account: true
+content:
+  language: en
+  language_mode: auto_product
+  title_max_chars: 100
+  hashtag_count: 5
+  extra_hashtags: []
+scheduler:
+  round1:
+    hour: 10
+    minute: 0
+  round2:
+    hour: 18
+    minute: 0
+  hour: 10
+  minute: 0

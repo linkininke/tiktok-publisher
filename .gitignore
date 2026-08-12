@@ -1,0 +1,35 @@
+# secrets & local env
+.env
+*.pem
+*.key
+
+# runtime / bundled app (too large; not source)
+_internal/
+_tools/
+TikTokPublisher.exe
+*.pyc
+__pycache__/
+
+# local data & media
+data/
+logs/
+videos/
+_tools/logs/
+*.mp4
+*.mov
+*.avi
+
+# editor / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
+
+# temp / downloads
+*.zip
+*.7z
+MinGit/
+
+config.yaml
+
