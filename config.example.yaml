@@ -26,7 +26,7 @@ poll:
   posts_per_account: 1
   rounds_per_day: 2
   per_ip_group: 5
-  parallel_ips: false
+  parallel_ips: true
   max_parallel_ips: 0
   account_cooldown_seconds: 21600
   ip_group_cooldown_seconds: 600

@@ -1,4 +1,4 @@
-"""UI 增强：语种选项、代理端口、强制快速终止、主窗可关。"""
+"""UI 增强：常用操作前置、并行上限、代理端口、强制快速终止、主窗可关。"""
 
 from __future__ import annotations
 
@@ -11,6 +11,9 @@ logger = logging.getLogger("publisher")
 
 _LANG_CHOICES = []  # 保留占位，语种已改为始终跟随 Excel 品名
 _MODE_CHOICES = []
+
+# 本机机场默认端口（用户当前环境）
+_DEFAULT_PROXY_PORT = "6850"
 
 
 def _find_scrollable(widget):
@@ -25,6 +28,83 @@ def _find_scrollable(widget):
     except Exception:
         pass
     return None
+
+
+def _widget_text(widget) -> str:
+    try:
+        return str(widget.cget("text") or "")
+    except Exception:
+        return ""
+
+
+def _iter_descendants(widget):
+    yield widget
+    try:
+        kids = list(widget.winfo_children())
+    except Exception:
+        kids = []
+    for ch in kids:
+        yield from _iter_descendants(ch)
+
+
+def _shift_grid_from_row(parent, from_row: int, delta: int) -> None:
+    """把 parent 里 row>=from_row 的子控件整体下移 delta。"""
+    if delta == 0:
+        return
+    items = []
+    try:
+        children = list(parent.winfo_children())
+    except Exception:
+        return
+    for child in children:
+        try:
+            info = dict(child.grid_info() or {})
+        except Exception:
+            continue
+        if not info or info.get("row") in (None, ""):
+            continue
+        try:
+            r = int(info["row"])
+        except Exception:
+            continue
+        if r >= from_row:
+            items.append((child, info, r))
+    # 先从大到小挪，避免覆盖
+    items.sort(key=lambda x: x[2], reverse=(delta > 0))
+    for child, info, r in items:
+        kw = {
+            "row": r + delta,
+            "column": int(info.get("column", 0) or 0),
+            "sticky": info.get("sticky") or "",
+        }
+        if info.get("columnspan"):
+            kw["columnspan"] = int(info["columnspan"])
+        if info.get("rowspan"):
+            kw["rowspan"] = int(info["rowspan"])
+        if info.get("padx") not in (None, ""):
+            kw["padx"] = info["padx"]
+        if info.get("pady") not in (None, ""):
+            kw["pady"] = info["pady"]
+        try:
+            child.grid(**kw)
+        except Exception:
+            try:
+                child.grid(row=r + delta, column=int(info.get("column", 0) or 0))
+            except Exception:
+                pass
+
+
+def _find_labeled_row(scroll, label_text: str):
+    """找到设置页某标签所在行，返回 (row, label_widget)。"""
+    for child in _iter_descendants(scroll):
+        if label_text in _widget_text(child):
+            try:
+                info = child.grid_info() or {}
+                if info.get("row") is not None:
+                    return int(info["row"]), child
+            except Exception:
+                continue
+    return None, None
 
 
 def _norm_proxy_port(raw: str) -> str:
@@ -83,6 +163,670 @@ def _apply_proxy_env(port_or_url: str) -> tuple[str, str]:
     return url, url
 
 
+def _ensure_set_vars(app) -> dict:
+    if not hasattr(app, "_set_vars") or app._set_vars is None:
+        app._set_vars = {}
+    return app._set_vars
+
+
+def _is_tk_variable(obj) -> bool:
+    """区分 StringVar/IntVar 与设置页里的 CTkEntry 控件。"""
+    if obj is None:
+        return False
+    # 原版 _set_vars[key] = CTkEntry；补丁扩展字段才是 StringVar
+    return hasattr(obj, "trace_add") and callable(getattr(obj, "set", None))
+
+
+def _get_form_value(obj, default: str = "") -> str:
+    if obj is None:
+        return default
+    try:
+        return str(obj.get()).strip()
+    except Exception:
+        return default
+
+
+def _set_form_value(obj, value) -> None:
+    """写入 StringVar 或 CTkEntry，避免对 Entry 调用 .set()。"""
+    if obj is None:
+        return
+    text = "" if value is None else str(value)
+    if _is_tk_variable(obj):
+        try:
+            obj.set(text)
+            return
+        except Exception:
+            pass
+    # CTkEntry / Entry
+    try:
+        obj.delete(0, "end")
+        if text:
+            obj.insert(0, text)
+        return
+    except Exception:
+        pass
+    try:
+        obj.set(text)
+    except Exception:
+        logger.debug("写入表单值失败 key=%r", type(obj).__name__)
+
+
+def _probe_machine_perf() -> dict:
+    """探测本机 CPU / 内存（Windows 优先，无第三方依赖）。"""
+    import os
+    import subprocess
+
+    cores = int(os.cpu_count() or 4)
+    ram_gb = 0.0
+    # 物理核心（若能读到）
+    physical = 0
+    try:
+        out = subprocess.check_output(
+            ["wmic", "cpu", "get", "NumberOfCores,NumberOfLogicalProcessors", "/value"],
+            text=True,
+            timeout=5,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        for line in out.splitlines():
+            if line.startswith("NumberOfCores="):
+                physical = int(line.split("=", 1)[1].strip() or 0)
+            elif line.startswith("NumberOfLogicalProcessors="):
+                cores = int(line.split("=", 1)[1].strip() or cores)
+    except Exception:
+        pass
+    try:
+        out = subprocess.check_output(
+            ["wmic", "ComputerSystem", "get", "TotalPhysicalMemory", "/value"],
+            text=True,
+            timeout=5,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        for line in out.splitlines():
+            if line.startswith("TotalPhysicalMemory="):
+                raw = int(line.split("=", 1)[1].strip() or 0)
+                ram_gb = raw / (1024**3)
+                break
+    except Exception:
+        pass
+    if ram_gb <= 0:
+        try:
+            import ctypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+            ram_gb = stat.ullTotalPhys / (1024**3)
+        except Exception:
+            ram_gb = 8.0
+    return {
+        "logical_cores": max(1, cores),
+        "physical_cores": max(0, physical),
+        "ram_gb": float(ram_gb),
+    }
+
+
+def _count_ip_groups() -> int:
+    try:
+        from ui.services import list_accounts_ui
+
+        rows = list_accounts_ui() or []
+        groups = {
+            str((r or {}).get("proxy_group") or "").strip()
+            for r in rows
+            if (r or {}).get("enabled", True)
+        }
+        groups.discard("")
+        return len(groups)
+    except Exception:
+        try:
+            import yaml
+            from pathlib import Path
+            import config_loader
+
+            root = Path(getattr(config_loader, "ROOT", Path(".")))
+            acc = root / "data" / "accounts.yaml"
+            if not acc.is_file():
+                return 0
+            data = yaml.safe_load(acc.read_text(encoding="utf-8")) or {}
+            groups = set()
+            for a in data.get("accounts") or []:
+                if not (a or {}).get("enabled", True):
+                    continue
+                g = str((a or {}).get("proxy_group") or "").strip()
+                if g:
+                    groups.add(g)
+            return len(groups)
+        except Exception:
+            return 0
+
+
+def recommend_parallel_ips() -> dict:
+    """按电脑性能推荐并行 IP 数。
+
+    经验：每条并行 IP ≈ 开 1 个比特 Chromium，约吃 1.5～2 逻辑核 + 1.8GB 内存。
+    预留 2 核 + 4GB 给系统和本软件。
+    """
+    perf = _probe_machine_perf()
+    cores = int(perf["logical_cores"])
+    ram_gb = float(perf["ram_gb"])
+    ip_groups = _count_ip_groups()
+
+    # CPU：留 2 核，每窗口约 2 核
+    cpu_rec = max(1, (cores - 2) // 2)
+    # 内存：留 4GB，每窗口约 1.8GB
+    ram_headroom = max(0.0, ram_gb - 4.0)
+    ram_rec = max(1, int(ram_headroom // 1.8)) if ram_headroom >= 1.8 else 1
+
+    machine_rec = max(1, min(cpu_rec, ram_rec, 8))  # 软上限 8，避免误推太高
+    if ip_groups > 0:
+        final = max(1, min(machine_rec, ip_groups))
+    else:
+        final = machine_rec
+
+    bottleneck = "CPU" if cpu_rec <= ram_rec else "内存"
+    return {
+        "recommend": final,
+        "cpu_rec": cpu_rec,
+        "ram_rec": ram_rec,
+        "logical_cores": cores,
+        "physical_cores": perf.get("physical_cores") or 0,
+        "ram_gb": round(ram_gb, 1),
+        "ip_groups": ip_groups,
+        "bottleneck": bottleneck,
+    }
+
+
+def _apply_parallel_recommend(app, *, ask: bool = True) -> None:
+    """写入推荐并行上限，可选弹窗说明。"""
+    from tkinter import messagebox
+
+    info = recommend_parallel_ips()
+    rec = int(info["recommend"])
+    vars_ = _ensure_set_vars(app)
+    ov = getattr(app, "_ov_quick", None) or {}
+
+    detail = (
+        f"检测到：逻辑核 {info['logical_cores']}"
+        + (f"（物理核 {info['physical_cores']}）" if info.get("physical_cores") else "")
+        + f" · 内存约 {info['ram_gb']} GB"
+        + (f" · 当前 IP 组 {info['ip_groups']} 个" if info["ip_groups"] else " · 尚未同步账号")
+        + f"\n\n按性能估算：CPU 可撑约 {info['cpu_rec']}，内存可撑约 {info['ram_rec']}"
+        + f"（瓶颈偏{info['bottleneck']}）"
+        + f"\n推荐并行 IP 上限 = {rec}"
+        + ("\n（已按你现有 IP 组数封顶）" if info["ip_groups"] and rec == info["ip_groups"] else "")
+        + "\n\n是否填入并打开「多 IP 并行」？"
+    )
+    if ask:
+        if not messagebox.askyesno("推荐并行数", detail):
+            return
+
+    if "max_parallel_ips" not in vars_:
+        import customtkinter as ctk
+
+        vars_["max_parallel_ips"] = ctk.StringVar(value=str(rec))
+    else:
+        _set_form_value(vars_["max_parallel_ips"], str(rec))
+    if "max_parallel" in ov:
+        try:
+            ov["max_parallel"].set(str(rec))
+        except Exception:
+            pass
+    if "parallel" in ov:
+        try:
+            ov["parallel"].set(1)
+        except Exception:
+            pass
+    try:
+        if hasattr(app, "_set_parallel"):
+            app._set_parallel.select()
+    except Exception:
+        pass
+
+    logger.info(
+        "推荐并行 IP=%s（CPU=%s RAM=%.1fGB groups=%s）",
+        rec,
+        info["logical_cores"],
+        info["ram_gb"],
+        info["ip_groups"],
+    )
+    if ask:
+        messagebox.showinfo(
+            "已填入推荐值",
+            f"已将并行上限设为 {rec}，并开启多 IP 并行。\n请再点「保存快捷设置」写入配置。",
+        )
+
+
+def _sync_overview_quick_from_settings(app) -> None:
+    """设置页开关/输入 → 总览快捷条。"""
+    ov = getattr(app, "_ov_quick", None) or {}
+    if not ov:
+        return
+    vars_ = getattr(app, "_set_vars", {}) or {}
+    try:
+        if hasattr(app, "_set_parallel") and "parallel" in ov:
+            on = bool(app._set_parallel.get())
+            ov["parallel"].set(1 if on else 0)
+    except Exception:
+        pass
+    try:
+        if hasattr(app, "_set_dry") and "dry" in ov:
+            on = bool(app._set_dry.get())
+            ov["dry"].set(1 if on else 0)
+    except Exception:
+        pass
+    try:
+        if "max_parallel_ips" in vars_ and "max_parallel" in ov:
+            ov["max_parallel"].set(_get_form_value(vars_["max_parallel_ips"], "0") or "0")
+    except Exception:
+        pass
+    try:
+        if "proxy_port" in vars_ and "proxy_port" in ov:
+            ov["proxy_port"].set(_get_form_value(vars_["proxy_port"], ""))
+    except Exception:
+        pass
+
+
+def _save_overview_quick(app) -> None:
+    """从总览快捷条写回设置页控件并保存。"""
+    ov = getattr(app, "_ov_quick", None) or {}
+    vars_ = _ensure_set_vars(app)
+    try:
+        if "parallel" in ov and hasattr(app, "_set_parallel"):
+            if int(ov["parallel"].get()):
+                app._set_parallel.select()
+            else:
+                app._set_parallel.deselect()
+    except Exception:
+        pass
+    try:
+        if "dry" in ov and hasattr(app, "_set_dry"):
+            if int(ov["dry"].get()):
+                app._set_dry.select()
+            else:
+                app._set_dry.deselect()
+    except Exception:
+        pass
+    try:
+        if "max_parallel" in ov:
+            val = str(ov["max_parallel"].get()).strip() or "0"
+            if "max_parallel_ips" not in vars_:
+                import customtkinter as ctk
+
+                vars_["max_parallel_ips"] = ctk.StringVar(value=val)
+            else:
+                _set_form_value(vars_["max_parallel_ips"], val)
+    except Exception:
+        pass
+    try:
+        if "proxy_port" in ov:
+            val = str(ov["proxy_port"].get()).strip()
+            if "proxy_port" not in vars_:
+                import customtkinter as ctk
+
+                vars_["proxy_port"] = ctk.StringVar(value=val)
+            else:
+                _set_form_value(vars_["proxy_port"], val)
+    except Exception:
+        pass
+    try:
+        app._save_settings()
+    except Exception as e:
+        logger.warning("快捷设置保存失败: %s", e)
+
+
+def _enhance_overview_ux(app, ctk, ui_app) -> None:
+    """总览：插入「快捷设置」+ 把高频按钮排到前面。"""
+    frames = getattr(app, "_frames", {}) or {}
+    page = frames.get("overview")
+    if page is None:
+        return
+    body = _find_scrollable(page)
+    if body is None:
+        return
+
+    fonts = getattr(ui_app, "FONTS", {})
+    colors = getattr(ui_app, "COLORS", {})
+
+    # 在「网络预检」下方插入快捷设置（把后续行下移）
+    insert_at = 3
+    try:
+        net = getattr(app, "_ov_net", None)
+        if net is not None:
+            info = net.grid_info() or {}
+            if info.get("row") is not None:
+                insert_at = int(info["row"]) + 1
+    except Exception:
+        insert_at = 3
+
+    _shift_grid_from_row(body, insert_at, 2)
+
+    panel = ctk.CTkFrame(body, fg_color=colors.get("surface", "#1a2220"), corner_radius=12)
+    panel.grid(row=insert_at, column=0, columnspan=2, sticky="ew", padx=6, pady=(10, 6))
+    try:
+        panel.grid_columnconfigure(1, weight=1)
+        panel.grid_columnconfigure(3, weight=1)
+    except Exception:
+        pass
+
+    ctk.CTkLabel(
+        panel,
+        text="快捷设置（最常用）",
+        font=fonts.get("h2") or fonts.get("body"),
+        text_color=colors.get("text", "#E8EEEC"),
+        anchor="w",
+    ).grid(row=0, column=0, columnspan=4, sticky="w", padx=14, pady=(12, 4))
+
+    ctk.CTkLabel(
+        panel,
+        text="改完点「保存快捷设置」。多 IP 并行=不同出口同时跑；上限 0=不限制。",
+        font=fonts.get("small"),
+        text_color=colors.get("muted", "#888"),
+        anchor="w",
+    ).grid(row=1, column=0, columnspan=4, sticky="w", padx=14, pady=(0, 8))
+
+    # 读取当前配置默认值
+    parallel_on = False
+    max_par = "0"
+    dry_on = False
+    port = _DEFAULT_PROXY_PORT
+    try:
+        from ui.services import load_config_raw
+
+        cfg = load_config_raw()
+        poll = cfg.get("poll") or {}
+        pub = cfg.get("publish") or {}
+        parallel_on = bool(poll.get("parallel_ips"))
+        max_par = str(poll.get("max_parallel_ips") if poll.get("max_parallel_ips") is not None else 0)
+        dry_on = bool(pub.get("dry_run"))
+    except Exception:
+        pass
+    try:
+        proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy") or ""
+        if proxy:
+            import re
+
+            m = re.search(r":(\d+)(?:/|$)", proxy)
+            if m:
+                port = m.group(1)
+    except Exception:
+        pass
+
+    # 总览必须用独立 StringVar：原版 _set_vars['max_parallel_ips'] 是 CTkEntry，
+    # 不能当 textvariable（会触发 Entry.trace_add 报错）。
+    vars_ = _ensure_set_vars(app)
+    parallel_ivar = ctk.IntVar(value=1 if parallel_on else 0)
+    dry_ivar = ctk.IntVar(value=1 if dry_on else 0)
+
+    max_init = max_par
+    try:
+        if "max_parallel_ips" in vars_:
+            cur = _get_form_value(vars_["max_parallel_ips"], "")
+            if cur != "":
+                max_init = cur
+    except Exception:
+        pass
+    max_svar = ctk.StringVar(value=str(max_init))
+
+    port_init = port
+    try:
+        if "proxy_port" in vars_:
+            cur = _get_form_value(vars_["proxy_port"], "")
+            # 设置页若已有值优先；否则用探测到的端口
+            if cur != "":
+                port_init = cur
+    except Exception:
+        pass
+    port_svar = ctk.StringVar(value=str(port_init or ""))
+
+    # row2: 多IP并行 | 并行上限
+    ctk.CTkLabel(panel, text="多 IP 并行", font=fonts.get("body"), anchor="w").grid(
+        row=2, column=0, sticky="w", padx=(14, 8), pady=6
+    )
+    sw_par = ctk.CTkSwitch(panel, text="开启", variable=parallel_ivar, width=70)
+    sw_par.grid(row=2, column=1, sticky="w", padx=4, pady=6)
+
+    ctk.CTkLabel(panel, text="并行 IP 上限", font=fonts.get("body"), anchor="w").grid(
+        row=2, column=2, sticky="w", padx=(18, 8), pady=6
+    )
+    max_wrap = ctk.CTkFrame(panel, fg_color="transparent")
+    max_wrap.grid(row=2, column=3, sticky="w", padx=4, pady=6)
+    ent_max = ctk.CTkEntry(max_wrap, textvariable=max_svar, width=70, height=32)
+    ent_max.pack(side="left")
+    ctk.CTkButton(
+        max_wrap,
+        text="按性能推荐",
+        width=100,
+        height=32,
+        fg_color=colors.get("surface2", "#24302C"),
+        hover_color=colors.get("accent_hover", "#3D8B75"),
+        border_width=1,
+        border_color=colors.get("border", "#3A4A45"),
+        command=lambda: _apply_parallel_recommend(app, ask=True),
+    ).pack(side="left", padx=(8, 0))
+
+    # row3: 干跑 | 代理端口
+    ctk.CTkLabel(panel, text="干跑模式", font=fonts.get("body"), anchor="w").grid(
+        row=3, column=0, sticky="w", padx=(14, 8), pady=6
+    )
+    sw_dry = ctk.CTkSwitch(panel, text="不点发布", variable=dry_ivar, width=90)
+    sw_dry.grid(row=3, column=1, sticky="w", padx=4, pady=6)
+
+    ctk.CTkLabel(panel, text="本机代理端口", font=fonts.get("body"), anchor="w").grid(
+        row=3, column=2, sticky="w", padx=(18, 8), pady=6
+    )
+    ent_port = ctk.CTkEntry(panel, textvariable=port_svar, width=90, height=32)
+    ent_port.grid(row=3, column=3, sticky="w", padx=4, pady=6)
+
+    btn_row = ctk.CTkFrame(panel, fg_color="transparent")
+    btn_row.grid(row=4, column=0, columnspan=4, sticky="ew", padx=14, pady=(4, 12))
+
+    ctk.CTkButton(
+        btn_row,
+        text="保存快捷设置",
+        width=130,
+        height=34,
+        fg_color=colors.get("accent", "#2F6F5E"),
+        hover_color=colors.get("accent_hover", "#3D8B75"),
+        command=lambda: _save_overview_quick(app),
+    ).pack(side="left", padx=(0, 8))
+
+    ctk.CTkLabel(
+        btn_row,
+        text=f"端口示例 {_DEFAULT_PROXY_PORT}；留空=不走代理",
+        font=fonts.get("small"),
+        text_color=colors.get("muted", "#888"),
+        anchor="w",
+    ).pack(side="left")
+
+    app._ov_quick = {
+        "parallel": parallel_ivar,
+        "dry": dry_ivar,
+        "max_parallel": max_svar,
+        "proxy_port": port_svar,
+        "panel": panel,
+    }
+
+    # 常用操作栏插入「清理草稿」（插在「终止后台任务」前）
+    try:
+        stop_btn = None
+        for w in _iter_descendants(body):
+            if _widget_text(w) == "终止后台任务":
+                # 只改「常用操作」条里的那个，避免误改日志页同名按钮
+                try:
+                    parent_txt = ""
+                    p = w.master
+                    for _ in range(4):
+                        if p is None:
+                            break
+                        # 同级常见有「代理体检」
+                        sibs = []
+                        try:
+                            sibs = [_widget_text(x) for x in p.winfo_children()]
+                        except Exception:
+                            pass
+                        if "代理体检" in sibs or "多号干跑" in sibs:
+                            stop_btn = w
+                            break
+                        p = getattr(p, "master", None)
+                except Exception:
+                    continue
+                if stop_btn is not None:
+                    break
+        if stop_btn is not None:
+            qbar = stop_btn.master
+            clear_btn = ctk.CTkButton(
+                qbar,
+                text="清理草稿",
+                height=36,
+                fg_color=colors.get("surface2", "#24302C"),
+                hover_color=colors.get("accent_hover", "#3D8B75"),
+                border_width=1,
+                border_color=colors.get("border", "#3A4A45"),
+                command=lambda: app._start_clear_drafts(),
+            )
+            clear_btn.pack(side="left", padx=(10, 0), before=stop_btn)
+            app._ov_clear_drafts_btn = clear_btn
+    except Exception as e:
+        logger.warning("总览「清理草稿」按钮未加上: %s", e)
+
+    # 高频按钮视觉强调：真实发布更大/前置提示
+    try:
+        for w in _iter_descendants(body):
+            txt = _widget_text(w)
+            if txt == "多号真实发布":
+                try:
+                    w.configure(height=40, font=fonts.get("body"))
+                except Exception:
+                    pass
+            elif txt == "终止后台任务":
+                try:
+                    w.configure(height=36)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _start_clear_drafts(app) -> None:
+    """总览：后台清理各账号上传页未保存草稿。"""
+    from tkinter import messagebox
+
+    if not messagebox.askyesno(
+        "清理草稿",
+        "将对所有启用账号逐个打开 TikTok 上传页，并放弃「未保存草稿」弹窗。\n"
+        "过程中请勿关闭比特浏览器；可随时点「终止后台任务」。\n\n确定开始？",
+    ):
+        return
+
+    def job():
+        from tools_clear_drafts import run_clear_drafts
+
+        cancel = None
+        try:
+            cancel = app.runner.cancel_event
+        except Exception:
+            pass
+        return run_clear_drafts(cancel_event=cancel, apply_patch=False)
+
+    def done(info):
+        info = info or {}
+        ok = int(info.get("ok") or 0)
+        fail = int(info.get("fail") or 0)
+        total = int(info.get("total") or 0)
+        cancelled = bool(info.get("cancelled"))
+        text = f"成功 {ok}/{total}"
+        if fail:
+            text += f" · 失败 {fail}"
+        if cancelled:
+            text += " · 已中途终止"
+        errs = info.get("errors") or []
+        if errs:
+            sample = "；".join(
+                f"{e.get('name')}: {str(e.get('error') or '')[:60]}" for e in errs[:5]
+            )
+            text += f"\n\n失败摘要：{sample}"
+        if fail or cancelled:
+            messagebox.showwarning("清理草稿", text)
+        else:
+            messagebox.showinfo("清理草稿", text or "没有启用中的账号")
+
+    app._run_job("清理草稿", job, done)
+
+
+def _promote_settings_common(app, ctk, ui_app) -> None:
+    """设置页顶部加「常用」说明，并把并行上限提示写清楚。"""
+    frames = getattr(app, "_frames", {}) or {}
+    settings = frames.get("settings")
+    if settings is None:
+        return
+    scroll = _find_scrollable(settings)
+    if scroll is None:
+        return
+
+    fonts = getattr(ui_app, "FONTS", {})
+    colors = getattr(ui_app, "COLORS", {})
+
+    # 顶部插入提示条
+    _shift_grid_from_row(scroll, 0, 1)
+    tip = ctk.CTkLabel(
+        scroll,
+        text="【常用】干跑 / 多 IP 并行 / 并行上限 / 代理 → 总览可改；点「按性能推荐」可按 CPU/内存估算",
+        font=fonts.get("small"),
+        text_color=colors.get("accent", "#2F6F5E"),
+        anchor="w",
+    )
+    tip.grid(row=0, column=0, columnspan=3, sticky="w", padx=8, pady=(8, 4))
+
+    # 强化「并行 IP 上限」旁注，并在下一行加推荐按钮
+    row, lab = _find_labeled_row(scroll, "并行 IP 上限")
+    if row is not None:
+        try:
+            for child in list(scroll.winfo_children()):
+                info = child.grid_info() or {}
+                if int(info.get("row", -1)) == row and int(info.get("column", -1)) == 2:
+                    child.configure(text="0=不限制；也可在总览点「按性能推荐」")
+                    break
+        except Exception:
+            pass
+        try:
+            _shift_grid_from_row(scroll, row + 1, 1)
+            rec_row = ctk.CTkFrame(scroll, fg_color="transparent")
+            rec_row.grid(row=row + 1, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
+            ctk.CTkButton(
+                rec_row,
+                text="按电脑性能推荐并行数",
+                width=180,
+                height=32,
+                fg_color=colors.get("surface2", "#24302C"),
+                hover_color=colors.get("accent_hover", "#3D8B75"),
+                command=lambda: _apply_parallel_recommend(app, ask=True),
+            ).pack(side="left")
+            ctk.CTkLabel(
+                rec_row,
+                text="按 CPU/内存估算，并受当前 IP 组数封顶",
+                font=fonts.get("small"),
+                text_color=colors.get("muted", "#888"),
+                anchor="w",
+            ).pack(side="left", padx=(10, 0))
+        except Exception as e:
+            logger.debug("设置页推荐按钮未加上: %s", e)
+
+
 def apply_ui_extras_patches() -> None:
     import customtkinter as ctk
     from ui import app as ui_app
@@ -132,6 +876,25 @@ def apply_ui_extras_patches() -> None:
             self.resizable(True, True)
         except Exception as e:
             logger.debug("绑定关窗协议失败: %s", e)
+
+        # 总览：常用设置 + 按钮重排（settings 已建好，可共用变量）
+        try:
+            _enhance_overview_ux(self, ctk, ui_app)
+        except Exception as e:
+            logger.warning("总览 UX 增强失败: %s", e)
+        try:
+            _promote_settings_common(self, ctk, ui_app)
+        except Exception as e:
+            logger.warning("设置页常用前置失败: %s", e)
+        try:
+            # 把当前 config 同步到快捷控件
+            self.load_settings_form()
+        except Exception:
+            pass
+        try:
+            _sync_overview_quick_from_settings(self)
+        except Exception:
+            pass
 
     def _build_settings_fixed(self):
         original_build_settings(self)
@@ -229,13 +992,13 @@ def apply_ui_extras_patches() -> None:
         ctk.CTkLabel(scroll, text="本机代理端口", font=fonts.get("body"), anchor="w").grid(
             row=rr, column=0, sticky="w", pady=6
         )
-        port_var = ctk.StringVar(value="7890")
+        port_var = ctk.StringVar(value=_DEFAULT_PROXY_PORT)
         port_entry = ctk.CTkEntry(scroll, textvariable=port_var, height=34)
         port_entry.grid(row=rr, column=1, sticky="ew", padx=8, pady=6)
         self._set_vars["proxy_port"] = port_var
         ctk.CTkLabel(
             scroll,
-            text="如 7890，留空=不走代理",
+            text=f"如 {_DEFAULT_PROXY_PORT}，留空=不走代理",
             font=fonts.get("small"),
             text_color=colors.get("muted", "#888"),
             anchor="w",
@@ -284,12 +1047,26 @@ def apply_ui_extras_patches() -> None:
 
                 cfg = config_loader.load_config()
             except Exception:
-                return
-        content = cfg.get("content") or {}
-        pub = cfg.get("publish") or {}
-        if "product_display_name" in getattr(self, "_set_vars", {}):
-            self._set_vars["product_display_name"].set(
+                cfg = {}
+        content = (cfg or {}).get("content") or {}
+        pub = (cfg or {}).get("publish") or {}
+        poll = (cfg or {}).get("poll") or {}
+        vars_ = _ensure_set_vars(self)
+        if "product_display_name" in vars_:
+            vars_["product_display_name"].set(
                 pub.get("product_display_name") or "小黄车下单"
+            )
+        # 并行上限（确保总览/设置都能读到）
+        if "max_parallel_ips" not in vars_:
+            import customtkinter as ctk
+
+            vars_["max_parallel_ips"] = ctk.StringVar(
+                value=str(poll.get("max_parallel_ips") if poll.get("max_parallel_ips") is not None else 0)
+            )
+        else:
+            _set_form_value(
+                vars_["max_parallel_ips"],
+                str(poll.get("max_parallel_ips") if poll.get("max_parallel_ips") is not None else 0),
             )
         # 代理端口：从 HTTP_PROXY 解析
         proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy") or ""
@@ -302,17 +1079,22 @@ def apply_ui_extras_patches() -> None:
                 port = m.group(1)
             elif proxy.isdigit():
                 port = proxy
-        if "proxy_port" in getattr(self, "_set_vars", {}):
-            self._set_vars["proxy_port"].set(port or "")
+        if "proxy_port" in vars_:
+            _set_form_value(vars_["proxy_port"], port or "")
         # 同步完整代理输入框
-        if proxy and "http_proxy" in getattr(self, "_set_vars", {}):
+        if proxy and "http_proxy" in vars_:
             try:
-                self._set_vars["http_proxy"].set(proxy)
-                self._set_vars["https_proxy"].set(
-                    os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or proxy
+                _set_form_value(vars_["http_proxy"], proxy)
+                _set_form_value(
+                    vars_["https_proxy"],
+                    os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or proxy,
                 )
             except Exception:
                 pass
+        try:
+            _sync_overview_quick_from_settings(self)
+        except Exception:
+            pass
 
     def save_settings_from_ui_fixed(payload: dict):
         cfg_payload = dict(payload or {})
@@ -396,9 +1178,16 @@ def apply_ui_extras_patches() -> None:
             save_settings_from_ui_fixed(payload)
             from tkinter import messagebox
 
-            messagebox.showinfo("已保存", "设置已写入 config.yaml 与 .env（含语种/代理端口）")
+            messagebox.showinfo(
+                "已保存",
+                "设置已写入 config.yaml 与 .env（含多IP并行/并行上限/代理端口）",
+            )
             try:
                 self.refresh_overview()
+            except Exception:
+                pass
+            try:
+                _sync_overview_quick_from_settings(self)
             except Exception:
                 pass
         except Exception as e:
@@ -512,16 +1301,20 @@ def apply_ui_extras_patches() -> None:
     except Exception as e:
         logger.warning("代理失败跳过冷却补丁未生效: %s", e)
 
+    def _start_clear_drafts_method(self):
+        _start_clear_drafts(self)
+
     App.__init__ = __init_fixed  # type: ignore[method-assign]
     App._build_settings = _build_settings_fixed  # type: ignore[method-assign]
     App.load_settings_form = load_settings_form_fixed  # type: ignore[method-assign]
     App._save_settings = _save_settings_fixed  # type: ignore[method-assign]
     App._stop_job = _stop_job_fixed  # type: ignore[method-assign]
+    App._start_clear_drafts = _start_clear_drafts_method  # type: ignore[attr-defined]
     ui_services.save_settings_from_ui = save_settings_from_ui_fixed  # type: ignore[assignment]
     ui_workers.JobRunner.request_stop = request_stop_fixed  # type: ignore[method-assign]
     publisher.PublisherService._interruptible_sleep = interruptible_sleep_fixed  # type: ignore[method-assign]
 
     # 原版 submit 已是 daemon，不再全局替换 threading.Thread
     logger.info(
-        "已应用补丁：设置页语种/代理端口、强制快速终止、主窗可直接关闭"
+        "已应用补丁：总览快捷设置 + 清理草稿按钮 + 按性能推荐并行IP + 强制快速终止"
     )

@@ -7,6 +7,7 @@
 _internal/
 _tools/
 TikTokPublisher.exe
+TikTokPublisher_original.exe
 *.pyc
 __pycache__/
 
@@ -30,6 +31,10 @@ Desktop.ini
 *.zip
 *.7z
 MinGit/
+_pack_stage/
 
 config.yaml
 
+# local mapping scratch
+产品和视频对应
+产品和视频对应/

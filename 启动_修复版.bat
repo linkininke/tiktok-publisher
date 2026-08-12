@@ -35,8 +35,8 @@ if not exist "%~dp0patches\fix_discard_draft.py" (
   exit /b 1
 )
 
-echo 正在以「草稿弹窗修复版」启动 TikTokPublisher ...
-echo 请勿再直接双击 TikTokPublisher.exe（裸 exe 无法处理「放弃此次发布」二次确认）
+echo 正在以「修复版」启动 TikTokPublisher ...
+echo 也可直接双击 TikTokPublisher.exe（已指向修复版）
 "%~dp0_tools\py311\python.exe" "%~dp0run_fixed.py"
 if errorlevel 1 (
   echo.

@@ -99,6 +99,7 @@ def main() -> None:
     from fix_post_ai_check import apply_post_ai_check_patches
     from fix_caption_hashtags import apply_caption_hashtag_patches
     from fix_content_i18n import apply_content_i18n_patches
+    from fix_incident_log import apply_incident_log_patches, apply_incident_ui_patches
     from fix_ui_extras import apply_ui_extras_patches
 
     apply_patches()
@@ -106,7 +107,10 @@ def main() -> None:
     apply_post_ai_check_patches()
     apply_caption_hashtag_patches()
     apply_content_i18n_patches()
+    apply_incident_log_patches()
+    # UI 补丁：先 extras 再 incidents（incidents 再包一层 __init__ / 导航）
     apply_ui_extras_patches()
+    apply_incident_ui_patches()
 
     from ui.app import main as ui_main
 
