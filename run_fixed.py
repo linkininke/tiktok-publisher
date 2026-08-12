@@ -99,18 +99,33 @@ def main() -> None:
     from fix_post_ai_check import apply_post_ai_check_patches
     from fix_caption_hashtags import apply_caption_hashtag_patches
     from fix_content_i18n import apply_content_i18n_patches
+    from fix_modal_add_click import apply_modal_add_click_patches
     from fix_incident_log import apply_incident_log_patches, apply_incident_ui_patches
     from fix_ui_extras import apply_ui_extras_patches
+    from fix_all_proxies_failed import apply_all_proxies_failed_patches
+    from fix_precheck_hang import apply_precheck_hang_patches
+    from fix_proxy_probe import apply_proxy_probe_patches
+    from fix_publish_verify import apply_publish_verify_patches
 
     apply_patches()
     apply_sync_excel_patches()
     apply_post_ai_check_patches()
     apply_caption_hashtag_patches()
     apply_content_i18n_patches()
+    # 必须在 discard_draft / caption_hashtags 之后：包住 _click_modal_primary 与 AI「显示更多」
+    apply_modal_add_click_patches()
     apply_incident_log_patches()
     # UI 补丁：先 extras 再 incidents（incidents 再包一层 __init__ / 导航）
     apply_ui_extras_patches()
     apply_incident_ui_patches()
+    # 最后包一层：全部代理失败 → 立刻停 + 弹窗
+    apply_all_proxies_failed_patches()
+    # 网络预检后代理体检进度/超时，避免界面像卡住
+    apply_precheck_hang_patches()
+    # 必须在 precheck_hang 之后：代理体检换成真实连通性探测
+    apply_proxy_probe_patches()
+    # 放最后包住 _click_post：确认发布真的成功，未确认则保留视频
+    apply_publish_verify_patches()
 
     from ui.app import main as ui_main
 

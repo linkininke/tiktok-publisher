@@ -37,39 +37,178 @@ _COLLAPSE_LABELS = (
 )
 
 
-def _destroy_failed_video(product_id: str, video: Path) -> None:
-    """内容检测失败时销毁该视频并从映射移除，避免反复抽中。"""
+def _destroy_failed_video(
+    product_id: str,
+    video: Path,
+    *,
+    reason: str = "",
+    status: str = "fail",
+) -> dict:
+    """内容检测失败：删文件 + 映射去掉该视频 + Excel 去掉对应文本 + 写删除日志。"""
+    import json
+    import time
+    from datetime import datetime
+
+    video = Path(video)
+    info: dict = {
+        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "product_id": str(product_id or ""),
+        "video": video.name,
+        "reason": (reason or "内容审核不通过").strip() or "内容审核不通过",
+        "status": status or "fail",
+        "stage": "content_check_replace",
+        "deleted_file": False,
+        "mapping_updated": False,
+        "excel_updated": False,
+    }
+
+    root = Path(__file__).resolve().parent.parent
+    cfg = {}
+    map_file = root / "data" / "product_video_map.json"
+    videos_dir = video.parent if video.parent.exists() else root
+    excel = None
     try:
         import config_loader
-        from mapping_store import consume_video_after_success
 
-        root = Path(getattr(config_loader, "ROOT", None) or Path(__file__).resolve().parent.parent)
+        root = Path(getattr(config_loader, "ROOT", None) or root)
         cfg = config_loader.load_config(root / "config.yaml")
         map_file = root / cfg["paths"]["mapping_file"]
         videos_dir = Path(cfg["paths"]["videos_dir"])
         if not videos_dir.is_absolute():
             videos_dir = root / videos_dir
-        info = consume_video_after_success(
+        excel_path = Path(cfg["paths"].get("excel_file") or "")
+        if excel_path and not excel_path.is_absolute():
+            excel_path = root / excel_path
+        excel = excel_path if excel_path and str(excel_path) != "." else None
+    except Exception as e:
+        logger.debug("读取配置失败，使用默认路径: %s", e)
+
+    # 1) 映射 + 删文件（复用原版成功消费逻辑）
+    try:
+        from mapping_store import consume_video_after_success
+
+        consumed = consume_video_after_success(
             mapping_file=map_file,
             videos_dir=videos_dir,
             product_id=str(product_id),
             video_name=video.name,
             mapping_in_memory=None,
-        )
+        ) or {}
+        info["deleted_file"] = bool(consumed.get("deleted_file"))
+        info["mapping_updated"] = True
+        info["consume"] = {
+            k: consumed.get(k)
+            for k in ("deleted_file", "removed_from_mapping", "remaining")
+            if k in consumed
+        }
         logger.info(
             "内容检测失败，已销毁视频 product=%s video=%s deleted=%s",
             product_id,
             video.name,
-            (info or {}).get("deleted_file"),
+            info["deleted_file"],
         )
     except Exception as e:
         logger.warning("映射销毁失败，尝试直接删文件: %s", e)
         try:
-            if video.is_file():
-                video.unlink()
-                logger.info("已直接删除失败视频文件: %s", video)
+            target = video if video.is_file() else (videos_dir / video.name)
+            if target.is_file():
+                target.unlink()
+                info["deleted_file"] = True
+                logger.info("已直接删除失败视频文件: %s", target)
         except Exception as e2:
             logger.warning("删除失败视频文件失败: %s", e2)
+        # 兜底：手工从映射 JSON 去掉该视频名
+        try:
+            info["mapping_updated"] = _remove_video_from_mapping_file(
+                map_file, str(product_id), video.name
+            )
+        except Exception as e3:
+            logger.warning("手工更新映射失败: %s", e3)
+
+    # 2) Excel 去掉对应视频文本
+    if excel is not None:
+        try:
+            from sync_excel import remove_video_from_excel, rewrite_mapping_summary
+
+            excel_info = remove_video_from_excel(
+                excel, str(product_id), video.name, videos_dir=videos_dir
+            )
+            info["excel_updated"] = bool(excel_info.get("ok") and excel_info.get("removed"))
+            info["excel"] = excel_info
+            try:
+                rewrite_mapping_summary(excel, map_file)
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning("Excel 移除失败视频文本失败: %s", e)
+            info["excel_error"] = str(e).split("\n", 1)[0][:200]
+    else:
+        info["excel_error"] = "excel_path_missing"
+
+    # 3) 删除日志（jsonl + 可读 txt）
+    try:
+        _append_deleted_video_log(root, info)
+    except Exception as e:
+        logger.warning("写入删除视频日志失败: %s", e)
+
+    return info
+
+
+def _remove_video_from_mapping_file(map_file: Path, product_id: str, video_name: str) -> bool:
+    import json
+
+    map_file = Path(map_file)
+    if not map_file.exists():
+        return False
+    data = json.loads(map_file.read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        return False
+    key = Path(video_name).name.lower()
+    if not key.endswith(".mp4"):
+        key = key + ".mp4"
+    changed = False
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("product_id") or "") != str(product_id):
+            continue
+        vids = list(item.get("videos") or [])
+        kept = [v for v in vids if Path(str(v)).name.lower() != key]
+        if len(kept) != len(vids):
+            item["videos"] = kept
+            item["enabled"] = bool(kept)
+            changed = True
+        break
+    if changed:
+        map_file.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return changed
+
+
+def _append_deleted_video_log(root: Path, info: dict) -> None:
+    import json
+
+    log_dir = root / "logs"
+    try:
+        import config_loader
+
+        cfg = config_loader.load_config(root / "config.yaml")
+        log_dir = root / cfg["paths"].get("log_dir", "logs")
+    except Exception:
+        pass
+    log_dir.mkdir(parents=True, exist_ok=True)
+    jsonl = log_dir / "deleted_videos.jsonl"
+    txt = log_dir / "deleted_videos.txt"
+    with jsonl.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(info, ensure_ascii=False) + "\n")
+    line = (
+        f"[{info.get('ts')}] 商品ID={info.get('product_id')} "
+        f"视频={info.get('video')} 原因={info.get('reason')} "
+        f"删文件={info.get('deleted_file')} 映射={info.get('mapping_updated')} "
+        f"Excel={info.get('excel_updated')}"
+    )
+    with txt.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
+    logger.info("已记录删除视频日志: %s", line)
 
 
 def _text_visible(page, labels: tuple[str, ...], timeout: int = 600) -> bool:
@@ -484,7 +623,14 @@ def run_with_replace_loop_fixed(
             return last
 
         logger.info("视频 %s 审核不通过，销毁后尝试下一个", video.name)
-        _destroy_failed_video(product_id, video)
+        reason = str(getattr(last, "message", "") or "") or "内容审核不通过"
+        status = str(getattr(last, "status", "") or "fail")
+        _destroy_failed_video(
+            product_id,
+            video,
+            reason=reason,
+            status=status,
+        )
 
     return last
 

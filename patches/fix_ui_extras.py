@@ -665,28 +665,29 @@ def _enhance_overview_ux(app, ctk, ui_app) -> None:
     try:
         stop_btn = None
         for w in _iter_descendants(body):
-            if _widget_text(w) == "终止后台任务":
-                # 只改「常用操作」条里的那个，避免误改日志页同名按钮
-                try:
-                    parent_txt = ""
-                    p = w.master
-                    for _ in range(4):
-                        if p is None:
-                            break
-                        # 同级常见有「代理体检」
-                        sibs = []
-                        try:
-                            sibs = [_widget_text(x) for x in p.winfo_children()]
-                        except Exception:
-                            pass
-                        if "代理体检" in sibs or "多号干跑" in sibs:
-                            stop_btn = w
-                            break
-                        p = getattr(p, "master", None)
-                except Exception:
-                    continue
-                if stop_btn is not None:
-                    break
+            if not isinstance(w, ctk.CTkButton):
+                continue
+            if _widget_text(w) != "终止后台任务":
+                continue
+            # 只改「常用操作」条里的那个，避免误改日志页同名按钮
+            try:
+                p = w.master
+                for _ in range(4):
+                    if p is None:
+                        break
+                    sibs = []
+                    try:
+                        sibs = [_widget_text(x) for x in p.winfo_children()]
+                    except Exception:
+                        pass
+                    if "代理体检" in sibs or "多号干跑" in sibs:
+                        stop_btn = w
+                        break
+                    p = getattr(p, "master", None)
+            except Exception:
+                continue
+            if stop_btn is not None:
+                break
         if stop_btn is not None:
             qbar = stop_btn.master
             clear_btn = ctk.CTkButton(
@@ -701,12 +702,41 @@ def _enhance_overview_ux(app, ctk, ui_app) -> None:
             )
             clear_btn.pack(side="left", padx=(10, 0), before=stop_btn)
             app._ov_clear_drafts_btn = clear_btn
+
+            cool_btn = ctk.CTkButton(
+                qbar,
+                text="清理冷却缓存",
+                height=36,
+                fg_color=colors.get("surface2", "#24302C"),
+                hover_color=colors.get("accent_hover", "#3D8B75"),
+                border_width=1,
+                border_color=colors.get("border", "#3A4A45"),
+                command=lambda: app._clear_cooldown_cache(),
+            )
+            cool_btn.pack(side="left", padx=(10, 0), before=stop_btn)
+            app._ov_clear_cooldown_btn = cool_btn
+
+            del_log_btn = ctk.CTkButton(
+                qbar,
+                text="删除视频日志",
+                height=36,
+                fg_color=colors.get("surface2", "#24302C"),
+                hover_color=colors.get("accent_hover", "#3D8B75"),
+                border_width=1,
+                border_color=colors.get("border", "#3A4A45"),
+                command=lambda: app._open_deleted_videos_log(),
+            )
+            del_log_btn.pack(side="left", padx=(10, 0), before=stop_btn)
+            app._ov_deleted_videos_btn = del_log_btn
     except Exception as e:
         logger.warning("总览「清理草稿」按钮未加上: %s", e)
 
-    # 高频按钮视觉强调：真实发布更大/前置提示
+    # 高频按钮视觉强调：只改 CTkButton 本体。
+    # 切勿对按钮内部 Label 调 height——CTkLabel.height 会把按钮撑到上百像素。
     try:
         for w in _iter_descendants(body):
+            if not isinstance(w, ctk.CTkButton):
+                continue
             txt = _widget_text(w)
             if txt == "多号真实发布":
                 try:
@@ -766,6 +796,137 @@ def _start_clear_drafts(app) -> None:
             messagebox.showinfo("清理草稿", text or "没有启用中的账号")
 
     app._run_job("清理草稿", job, done)
+
+
+def _state_file_path():
+    from pathlib import Path
+
+    try:
+        import config_loader
+
+        root = Path(getattr(config_loader, "ROOT", None) or Path(__file__).resolve().parent.parent)
+        cfg = config_loader.load_config(root / "config.yaml")
+        return root / cfg["paths"]["state_file"]
+    except Exception:
+        return Path(__file__).resolve().parent.parent / "data" / "publish_state.json"
+
+
+def _deleted_videos_log_paths():
+    from pathlib import Path
+
+    try:
+        import config_loader
+
+        root = Path(getattr(config_loader, "ROOT", None) or Path(__file__).resolve().parent.parent)
+        cfg = config_loader.load_config(root / "config.yaml")
+        log_dir = root / cfg["paths"].get("log_dir", "logs")
+    except Exception:
+        root = Path(__file__).resolve().parent.parent
+        log_dir = root / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir / "deleted_videos.txt", log_dir / "deleted_videos.jsonl"
+
+
+def _clear_cooldown_cache(app) -> None:
+    """清空 publish_state.json 里的账号/IP 组冷却，保留发布历史。"""
+    import json
+    import shutil
+    from datetime import datetime
+    from tkinter import messagebox
+
+    state = _state_file_path()
+    if not state.is_file():
+        messagebox.showinfo("清理冷却缓存", f"未找到状态文件：\n{state}")
+        return
+
+    try:
+        data = json.loads(state.read_text(encoding="utf-8"))
+    except Exception as e:
+        messagebox.showerror("清理冷却缓存", f"读取失败：{e}")
+        return
+
+    cool = data.get("cooldowns") if isinstance(data, dict) else None
+    if not isinstance(cool, dict):
+        cool = {}
+    acc = cool.get("accounts") if isinstance(cool.get("accounts"), dict) else {}
+    ips = cool.get("ip_groups") if isinstance(cool.get("ip_groups"), dict) else {}
+    n_acc, n_ip = len(acc), len(ips)
+
+    if n_acc == 0 and n_ip == 0:
+        messagebox.showinfo("清理冷却缓存", "当前没有账号/IP 组冷却记录。")
+        return
+
+    if not messagebox.askyesno(
+        "清理冷却缓存",
+        f"将清空冷却记录（不影响发布历史/已用视频）：\n"
+        f"· 账号冷却：{n_acc} 条\n"
+        f"· IP 组冷却：{n_ip} 条\n\n"
+        f"会先备份再清空。确定？",
+    ):
+        return
+
+    try:
+        bak = state.with_name(
+            f"publish_state.bak_cooldown_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        )
+        shutil.copy2(state, bak)
+        data.setdefault("cooldowns", {})
+        data["cooldowns"]["accounts"] = {}
+        data["cooldowns"]["ip_groups"] = {}
+        state.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        logger.info(
+            "已清理冷却缓存 accounts=%s ip_groups=%s backup=%s",
+            n_acc,
+            n_ip,
+            bak.name,
+        )
+        for name in ("refresh_cooldown", "refresh_overview", "_refresh_overview"):
+            try:
+                fn = getattr(app, name, None)
+                if callable(fn):
+                    fn()
+            except Exception:
+                pass
+        messagebox.showinfo(
+            "清理冷却缓存",
+            f"已清空账号冷却 {n_acc}、IP 组冷却 {n_ip}。\n备份：{bak.name}",
+        )
+    except Exception as e:
+        messagebox.showerror("清理冷却缓存", f"写入失败：{e}")
+
+
+def _open_deleted_videos_log(app) -> None:
+    """预览并打开删除视频日志。"""
+    import os
+    from tkinter import messagebox
+
+    txt, jsonl = _deleted_videos_log_paths()
+    if not txt.is_file():
+        txt.write_text(
+            "# 内容审核不通过并销毁视频时会追加记录（含原因）\n",
+            encoding="utf-8",
+        )
+    try:
+        lines = [
+            ln
+            for ln in txt.read_text(encoding="utf-8", errors="replace").splitlines()
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+    except Exception:
+        lines = []
+
+    preview = "\n".join(lines[-12:]) if lines else "（暂无删除记录）"
+    tip = (
+        f"文件：{txt}\n"
+        f"另有：{jsonl.name}\n\n"
+        f"最近记录：\n{preview}\n\n"
+        f"点「是」用系统默认程序打开日志文件。"
+    )
+    if messagebox.askyesno("删除视频日志", tip):
+        try:
+            os.startfile(str(txt))  # type: ignore[attr-defined]
+        except Exception as e:
+            messagebox.showerror("打开失败", str(e))
 
 
 def _promote_settings_common(app, ctk, ui_app) -> None:
@@ -1253,9 +1414,13 @@ def apply_ui_extras_patches() -> None:
     except Exception as e:
         logger.debug("内容检查快速取消补丁跳过: %s", e)
 
-    # 代理/SOCKS 打不开上传页：不写 6 小时冷却，便于换代理后立刻重试
+    # 代理/SOCKS 打不开上传页、或跳到登录页：不写长冷却，立刻换下一号
     try:
-        from fix_discard_draft import _is_proxy_net_error
+        from fix_discard_draft import (
+            AccountLoginRequired,
+            _is_login_required_error,
+            _is_proxy_net_error,
+        )
 
         original_mark = publisher.PublisherService._mark_cooldowns
         current_rfa = publisher.PublisherService.run_for_account
@@ -1264,15 +1429,23 @@ def apply_ui_extras_patches() -> None:
             import sys
 
             exc = sys.exc_info()[1]
-            if exc is not None and _is_proxy_net_error(exc):
+            if exc is not None and (
+                _is_proxy_net_error(exc) or _is_login_required_error(exc)
+            ):
+                why = (
+                    "登录失效"
+                    if _is_login_required_error(exc)
+                    else "代理/网络失败"
+                )
                 logger.warning(
-                    "代理/网络失败，跳过写入账号与 IP 组冷却（可马上换代理重试）: %s",
+                    "%s，跳过写入账号与 IP 组冷却（可马上重试下一号）: %s",
+                    why,
                     str(exc).split("\n", 1)[0][:160],
                 )
                 return None
             if getattr(self, "_skip_next_cooldown", False):
                 self._skip_next_cooldown = False
-                logger.warning("已跳过本次冷却写入（代理/网络失败标记）")
+                logger.warning("已跳过本次冷却写入（代理/网络/登录跳过标记）")
                 return None
             return original_mark(self, *a, **k)
 
@@ -1280,14 +1453,21 @@ def apply_ui_extras_patches() -> None:
             try:
                 return current_rfa(self, account, count=count, **kwargs)
             except Exception as e:
-                if _is_proxy_net_error(e):
+                label = (
+                    (account or {}).get("name")
+                    or (account or {}).get("username")
+                    or (account or {}).get("profile_id")
+                    or "?"
+                )
+                if _is_login_required_error(e) or isinstance(e, AccountLoginRequired):
                     self._skip_next_cooldown = True
-                    label = (
-                        (account or {}).get("name")
-                        or (account or {}).get("username")
-                        or (account or {}).get("profile_id")
-                        or "?"
+                    logger.error(
+                        "账号 %s 跳转到 TikTok 登录页，本轮跳过自动化（不写长冷却）: %s",
+                        label,
+                        str(e).split("\n", 1)[0][:180],
                     )
+                elif _is_proxy_net_error(e):
+                    self._skip_next_cooldown = True
                     logger.error(
                         "账号 %s 代理/网络打不开 TikTok，本轮跳过（不写长冷却）: %s",
                         label,
@@ -1297,12 +1477,18 @@ def apply_ui_extras_patches() -> None:
 
         publisher.PublisherService._mark_cooldowns = mark_cooldowns_fixed  # type: ignore
         publisher.PublisherService.run_for_account = run_for_account_proxy_fixed  # type: ignore
-        logger.info("已应用补丁：代理/SOCKS 失败跳过账号且不写长冷却")
+        logger.info("已应用补丁：代理/SOCKS/登录页失败跳过账号且不写长冷却")
     except Exception as e:
-        logger.warning("代理失败跳过冷却补丁未生效: %s", e)
+        logger.warning("代理/登录跳过冷却补丁未生效: %s", e)
 
     def _start_clear_drafts_method(self):
         _start_clear_drafts(self)
+
+    def _clear_cooldown_cache_method(self):
+        _clear_cooldown_cache(self)
+
+    def _open_deleted_videos_log_method(self):
+        _open_deleted_videos_log(self)
 
     App.__init__ = __init_fixed  # type: ignore[method-assign]
     App._build_settings = _build_settings_fixed  # type: ignore[method-assign]
@@ -1310,11 +1496,13 @@ def apply_ui_extras_patches() -> None:
     App._save_settings = _save_settings_fixed  # type: ignore[method-assign]
     App._stop_job = _stop_job_fixed  # type: ignore[method-assign]
     App._start_clear_drafts = _start_clear_drafts_method  # type: ignore[attr-defined]
+    App._clear_cooldown_cache = _clear_cooldown_cache_method  # type: ignore[attr-defined]
+    App._open_deleted_videos_log = _open_deleted_videos_log_method  # type: ignore[attr-defined]
     ui_services.save_settings_from_ui = save_settings_from_ui_fixed  # type: ignore[assignment]
     ui_workers.JobRunner.request_stop = request_stop_fixed  # type: ignore[method-assign]
     publisher.PublisherService._interruptible_sleep = interruptible_sleep_fixed  # type: ignore[method-assign]
 
     # 原版 submit 已是 daemon，不再全局替换 threading.Thread
     logger.info(
-        "已应用补丁：总览快捷设置 + 清理草稿按钮 + 按性能推荐并行IP + 强制快速终止"
+        "已应用补丁：总览快捷设置 + 清理草稿/冷却缓存/删除视频日志 + 按性能推荐并行IP + 强制快速终止"
     )

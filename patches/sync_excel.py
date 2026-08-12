@@ -273,6 +273,150 @@ def sync(excel: Path, map_file: Path, videos_dir: Path | None = None) -> list[di
     return out
 
 
+def _video_name_key(name: str) -> str:
+    n = Path(str(name or "").strip()).name
+    if not n.lower().endswith(".mp4"):
+        n = n + ".mp4"
+    return n.lower()
+
+
+def remove_video_from_excel(
+    excel: Path,
+    product_id: str,
+    video_name: str,
+    *,
+    videos_dir: Path | None = None,
+) -> dict[str, Any]:
+    """从 Excel 对应商品行的视频列中删除指定视频文本（不删整行）。
+
+    返回: {ok, excel, product_id, video, removed, remaining, row}
+    """
+    excel = Path(excel)
+    pid = _clean_product_id(product_id)
+    target_key = _video_name_key(video_name)
+    if not excel.exists():
+        return {
+            "ok": False,
+            "excel": str(excel),
+            "product_id": pid,
+            "video": Path(video_name).name,
+            "removed": False,
+            "error": "excel_not_found",
+        }
+
+    wb = openpyxl.load_workbook(excel)
+    try:
+        ws = wb[wb.sheetnames[0]]
+        rows_iter = list(ws.iter_rows(values_only=True))
+        if not rows_iter:
+            return {
+                "ok": False,
+                "excel": str(excel),
+                "product_id": pid,
+                "video": Path(video_name).name,
+                "removed": False,
+                "error": "excel_empty",
+            }
+
+        header = rows_iter[0]
+        cols = _detect_columns(tuple(header))
+        header_name_raw = str(_cell(header, cols.get("name")) or "").strip()
+        start = 1
+        first_name = _clean_name(_cell(header, cols.get("name")))
+        if not HEADER_NAME.match(header_name_raw):
+            if first_name and _clean_product_id(_cell(header, cols.get("id"))):
+                start = 0
+        if "video" not in cols:
+            cols["video"] = 2
+
+        id_col = int(cols["id"]) + 1  # openpyxl 1-based
+        video_col = int(cols["video"]) + 1
+        found_row = None
+        remaining: list[str] = []
+        removed = False
+        original_text = ""
+
+        for ridx in range(start + 1, ws.max_row + 1):
+            row_pid = _clean_product_id(ws.cell(ridx, id_col).value)
+            if row_pid != pid:
+                continue
+            found_row = ridx
+            cell = ws.cell(ridx, video_col)
+            original_text = "" if cell.value is None else str(cell.value)
+            vids = _split_videos(cell.value)
+            kept = [v for v in vids if _video_name_key(v) != target_key]
+            removed = len(kept) < len(vids)
+            remaining = kept
+            # 尽量保留无后缀写法（若原单元格大多无 .mp4）
+            prefer_bare = bool(original_text) and ".mp4" not in original_text.lower()
+            if prefer_bare:
+                write_vals = [Path(v).stem for v in kept]
+            else:
+                write_vals = list(kept)
+            cell.value = ", ".join(write_vals) if write_vals else None
+            break
+
+        if found_row is None:
+            return {
+                "ok": False,
+                "excel": str(excel),
+                "product_id": pid,
+                "video": Path(video_name).name,
+                "removed": False,
+                "error": "product_row_not_found",
+            }
+
+        wb.save(excel)
+        logger.info(
+            "Excel 已移除视频文本 product=%s video=%s row=%s remaining=%s",
+            pid,
+            Path(video_name).name,
+            found_row,
+            remaining,
+        )
+        return {
+            "ok": True,
+            "excel": str(excel),
+            "product_id": pid,
+            "video": Path(video_name).name,
+            "removed": removed,
+            "remaining": remaining,
+            "row": found_row,
+            "before": original_text,
+        }
+    finally:
+        wb.close()
+
+
+def rewrite_mapping_summary(excel: Path | None, map_file: Path) -> None:
+    """根据当前映射重写旁路摘要「产品和视频对应.txt」。"""
+    map_file = Path(map_file)
+    if not map_file.exists():
+        return
+    try:
+        data = json.loads(map_file.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if not isinstance(data, list):
+        return
+    summary = map_file.with_name("产品和视频对应.txt")
+    lines = [
+        f"# 来源 Excel: {excel or '-'}",
+        f"# 正式映射: {map_file}",
+        "# 规则: 一行=一品名+一ID+多视频(按单元格顺序)",
+        "",
+    ]
+    for it in data:
+        if not isinstance(it, dict):
+            continue
+        vids = it.get("videos") or []
+        flag = "" if it.get("enabled") else "(无可用视频文件)"
+        lines.append(
+            f"{it.get('product_id')} | {it.get('product_name')} | videos({len(vids)})={', '.join(vids)} {flag}".rstrip()
+        )
+    summary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def resolve_default_excel() -> Path | None:
     desktop = Path.home() / "Desktop"
     candidates = [

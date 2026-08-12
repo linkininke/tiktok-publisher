@@ -214,10 +214,26 @@ def _page_alive(page) -> bool:
     if page is None:
         return False
     try:
+        if getattr(page, "is_closed", None) and page.is_closed():
+            return False
+    except Exception:
+        return False
+    try:
         _ = page.url
         return True
     except Exception:
         return False
+
+
+def _is_target_closed_error(exc: BaseException) -> bool:
+    name = type(exc).__name__
+    msg = str(exc or "").lower()
+    return (
+        "TargetClosed" in name
+        or "target closed" in msg
+        or "has been closed" in msg
+        or ("closed" in msg and ("page" in msg or "browser" in msg or "context" in msg))
+    )
 
 
 def _is_studio_upload_page(page) -> bool:
@@ -311,6 +327,7 @@ def _use_current_upload_page(self, page=None):
         working.wait_for_timeout(800)
     except Exception:
         pass
+    _assert_not_login_page(working, where="工作页跳转上传")
     discard_unsaved_draft_fixed(self, working)
     try:
         self._ensure_browser_zoom_100(working)
@@ -320,6 +337,9 @@ def _use_current_upload_page(self, page=None):
 
 
 def _is_proxy_net_error(exc: BaseException) -> bool:
+    if _is_target_closed_error(exc):
+        # 窗口被代理掐断时常见 TargetClosed；按网络失败处理（不写长冷却）
+        return True
     msg = str(exc or "")
     keys = (
         "PROXY_NETWORK_FAIL",
@@ -334,12 +354,110 @@ def _is_proxy_net_error(exc: BaseException) -> bool:
         "ERR_NAME_NOT_RESOLVED",
         "ERR_NETWORK_CHANGED",
         "ERR_INTERNET_DISCONNECTED",
+        "浏览器已关闭",
+        "无法恢复",
+        "页面/浏览器反复关闭",
     )
     return any(k in msg for k in keys)
 
 
 class ProxyNetworkError(RuntimeError):
     """比特窗口代理/网络打不开 TikTok，应跳过账号且不写长冷却。"""
+
+
+class AccountLoginRequired(RuntimeError):
+    """账号未登录 / 被踢到 TikTok 登录页：跳过本号自动化，继续下一号。"""
+
+
+def _is_login_required_error(exc: BaseException | None) -> bool:
+    if exc is None:
+        return False
+    if isinstance(exc, AccountLoginRequired):
+        return True
+    msg = str(exc or "")
+    return "ACCOUNT_LOGIN_REQUIRED" in msg or "TikTok 登录页" in msg
+
+
+def _is_tiktok_login_page(page) -> bool:
+    """新建/跳转后落到登录页（账号失效、掉线、需重新登录）。"""
+    try:
+        url = (page.url or "").lower()
+    except Exception:
+        return False
+    if not url or url in ("about:blank", "chrome://newtab/"):
+        return False
+    # 明确登录入口
+    url_hits = (
+        "login.tiktok.com",
+        "/login",
+        "/signup",
+        "/sign-up",
+        "/passport",
+        "/oauth",
+        "account/login",
+        "phone-or-email",
+        "login/phone",
+        "login/email",
+    )
+    if any(k in url for k in url_hits):
+        # Studio 上传页 URL 里一般不会带这些；若带了也当登录
+        if "tiktokstudio/upload" not in url:
+            return True
+    # 打开 Studio 却被重定向到非 studio（常见登录落地）
+    if "tiktok.com" in url and "tiktokstudio" not in url:
+        try:
+            body = (page.inner_text("body", timeout=2500) or "")[:4000]
+        except Exception:
+            body = ""
+        body_l = body.lower()
+        login_markers = (
+            "log in",
+            "sign up",
+            "登录",
+            "登入",
+            "註冊",
+            "注册",
+            "使用手机",
+            "手机号",
+            "email address",
+            "continue with",
+            "使用邮箱",
+            "password",
+            "密码",
+        )
+        if any(m.lower() in body_l if m.isascii() else m in body for m in login_markers):
+            # 排除仍像上传/创作中心的页面
+            if not any(
+                x in body
+                for x in ("选择视频", "Select video", "上传视频", "Upload video", "挂车", "产品链接")
+            ):
+                return True
+    return False
+
+
+def _assert_not_login_page(page, *, where: str = "") -> None:
+    if page is None:
+        return
+    try:
+        # 给重定向上登录页一点时间
+        page.wait_for_timeout(400)
+    except Exception:
+        pass
+    if not _is_tiktok_login_page(page):
+        return
+    try:
+        url = page.url
+    except Exception:
+        url = "?"
+    where_s = f"（{where}）" if where else ""
+    logger.error(
+        "检测到 TikTok 登录页%s，跳过本账号自动化: %s",
+        where_s,
+        url,
+    )
+    raise AccountLoginRequired(
+        f"ACCOUNT_LOGIN_REQUIRED: 账号需重新登录 TikTok{where_s}，已跳过。url={url}"
+    )
 
 
 def _goto_upload_with_retry(page, target: str, attempts: int = 3) -> None:
@@ -349,7 +467,14 @@ def _goto_upload_with_retry(page, target: str, attempts: int = 3) -> None:
         try:
             logger.info("打开上传页%s: %s", f"（第{i}次）" if attempts > 1 else "", target)
             page.goto(target, wait_until="domcontentloaded", timeout=120000)
+            try:
+                page.wait_for_timeout(600)
+            except Exception:
+                pass
+            _assert_not_login_page(page, where=f"打开上传页第{i}次")
             return
+        except AccountLoginRequired:
+            raise
         except Exception as e:
             last = e
             if not _is_proxy_net_error(e):
@@ -485,6 +610,8 @@ def ensure_upload_stage(self, page):
     if not _page_alive(working):
         raise RuntimeError("页面已关闭，无法进入上传阶段")
 
+    _assert_not_login_page(working, where="进入上传阶段前")
+
     target = _resolve_upload_url(self)
     # URL 不对时先回到上传地址
     try:
@@ -495,6 +622,7 @@ def ensure_upload_stage(self, page):
         logger.info("当前不在上传 URL，跳转: %s (was %s)", target, cur)
         working.goto(target, wait_until="domcontentloaded", timeout=120000)
         working.wait_for_timeout(1000)
+        _assert_not_login_page(working, where="跳转上传 URL 后")
 
     discard_unsaved_draft_fixed(self, working)
 
@@ -508,8 +636,11 @@ def ensure_upload_stage(self, page):
         # 再强刷一次上传 URL
         working.goto(target, wait_until="domcontentloaded", timeout=120000)
         working.wait_for_timeout(1200)
+        _assert_not_login_page(working, where="强刷上传 URL 后")
         discard_unsaved_draft_fixed(self, working)
         _click_sidebar_upload(working)
+
+    _assert_not_login_page(working, where="等待进入上传阶段时")
 
     for _ in range(10):
         if _looks_like_upload_stage(working):
@@ -520,38 +651,78 @@ def ensure_upload_stage(self, page):
             working.wait_for_timeout(500)
         except Exception:
             break
+        _assert_not_login_page(working, where="轮询上传阶段时")
 
     # 最后兜底：即使判断失败也返回当前页，让后续 set_input_files 报更明确错误
+    _assert_not_login_page(working, where="上传阶段兜底")
     logger.warning("未能确认上传阶段 UI，继续尝试。url=%s", getattr(working, "url", ""))
     self.page = working
     return working
 
 
-def _recover_page_if_closed(self, page):
-    """选视频后若原 page 被关，切换到 context 里最新可用页。"""
+def _recover_page_if_closed(self, page, *, reopen_upload: bool = False):
+    """选视频后若原 page 被关，切换到 context 里最新可用页；必要时新建上传页。"""
     if _page_alive(page):
         self.page = page
         return page
-    logger.warning("工作页已关闭，尝试切换到最新标签…")
+    logger.warning("工作页已关闭，尝试切换/重建上传页…")
     browser = getattr(self, "_browser", None)
-    if not browser or not browser.contexts:
-        raise RuntimeError("浏览器已关闭")
-    context = browser.contexts[0]
-    pages = list(context.pages)
-    if not pages:
-        raise RuntimeError("无可用页面")
-    # 优先带 upload 的页
+    try:
+        contexts = list(getattr(browser, "contexts", None) or []) if browser else []
+    except Exception:
+        contexts = []
+    if not browser or not contexts:
+        raise RuntimeError("浏览器已关闭（TargetClosed）：比特窗口可能被关掉或代理中断")
+
+    context = contexts[0]
+    try:
+        pages = list(context.pages)
+    except Exception:
+        pages = []
+
+    # 优先带 upload 的存活页
     for p in reversed(pages):
+        if not _page_alive(p):
+            continue
         try:
-            if "upload" in (p.url or "").lower():
+            if "upload" in ((p.url or "").lower()):
                 self.page = p
                 logger.info("已切换到上传相关页: %s", p.url)
                 return p
         except Exception:
             continue
-    self.page = pages[-1]
-    logger.info("已切换到最新页: %s", getattr(self.page, "url", ""))
-    return self.page
+    for p in reversed(pages):
+        if _page_alive(p):
+            self.page = p
+            logger.info("已切换到最新页: %s", getattr(self.page, "url", ""))
+            if reopen_upload or not _is_studio_upload_page(p):
+                try:
+                    target = _resolve_upload_url(self)
+                    _goto_upload_with_retry(p, target, attempts=2)
+                    discard_unsaved_draft_fixed(self, p)
+                except Exception as e:
+                    logger.warning("旧页重开上传地址失败，将新建标签: %s", e)
+                    break
+                else:
+                    return p
+            return p
+
+    # 无可用页：新建标签打开上传页（不强制关掉其它页，避免误杀）
+    try:
+        new_page = context.new_page()
+    except Exception as e:
+        raise RuntimeError(f"浏览器上下文不可用，无法新建页面: {e}") from e
+    self.page = new_page
+    self._upload_page_ready = True  # type: ignore[attr-defined]
+    target = _resolve_upload_url(self)
+    logger.info("无存活标签，新建上传页: %s", target)
+    _goto_upload_with_retry(new_page, target, attempts=3)
+    try:
+        new_page.wait_for_timeout(800)
+    except Exception:
+        pass
+    discard_unsaved_draft_fixed(self, new_page)
+    return new_page
 
 
 def _pick_video_file_input(page):
@@ -641,44 +812,67 @@ def _upload_video_via_video_input(self, page, video_path) -> None:
 def _wait_upload_ready_with_progress(self, page, timeout_sec: int = 180):
     import time
 
-    page = _recover_page_if_closed(self, page)
+    page = _recover_page_if_closed(self, page, reopen_upload=False)
     deadline = time.time() + max(30, int(timeout_sec or 180))
     last_log = 0.0
     caption_sels = list(self.SELECTORS.get("caption") or [])
     post_sels = list(self.SELECTORS.get("post_btn") or [])
     sels = caption_sels + post_sels
+    closed_hits = 0
 
     while time.time() < deadline:
-        page = _recover_page_if_closed(self, page)
-        for sel in sels:
-            try:
-                if page.locator(sel).first.is_visible(timeout=400):
-                    logger.info("上传界面已就绪 (%s)", sel)
-                    self.page = page
-                    return page
-            except Exception:
-                continue
-        now = time.time()
-        if now - last_log >= 10:
-            last_log = now
-            left = int(deadline - now)
-            try:
-                body = page.inner_text("body") or ""
-            except Exception:
-                body = ""
-            stuck = "选择要上传的视频" in body or "选择视频" in body
-            logger.info(
-                "等待上传编辑页… 剩余约 %ss%s",
-                left,
-                "（仍停在选择视频页，可能未真正选中视频）" if stuck else "",
-            )
         try:
+            page = _recover_page_if_closed(self, page, reopen_upload=closed_hits >= 1)
+            for sel in sels:
+                try:
+                    if page.locator(sel).first.is_visible(timeout=400):
+                        logger.info("上传界面已就绪 (%s)", sel)
+                        self.page = page
+                        return page
+                except Exception as e:
+                    if _is_target_closed_error(e):
+                        raise
+                    continue
+            now = time.time()
+            if now - last_log >= 10:
+                last_log = now
+                left = int(deadline - now)
+                try:
+                    body = page.inner_text("body") or ""
+                except Exception as e:
+                    if _is_target_closed_error(e):
+                        raise
+                    body = ""
+                stuck = "选择要上传的视频" in body or "选择视频" in body
+                logger.info(
+                    "等待上传编辑页… 剩余约 %ss%s",
+                    left,
+                    "（仍停在选择视频页，可能未真正选中视频）" if stuck else "",
+                )
             page.wait_for_timeout(800)
         except Exception as e:
-            if "closed" in str(e).lower():
-                page = _recover_page_if_closed(self, page)
-                continue
-            raise
+            if not _is_target_closed_error(e):
+                raise
+            closed_hits += 1
+            logger.warning(
+                "等待上传就绪时页面关闭 (#%s)，尝试恢复: %s",
+                closed_hits,
+                str(e).split("\n", 1)[0][:160],
+            )
+            if closed_hits >= 6:
+                raise RuntimeError(
+                    "上传页反复关闭（TargetClosed），请检查比特窗口是否被关、代理是否中断"
+                ) from e
+            try:
+                page = _recover_page_if_closed(
+                    self, getattr(self, "page", None), reopen_upload=True
+                )
+            except Exception as e2:
+                logger.warning("恢复上传页失败: %s", e2)
+                raise RuntimeError(
+                    f"浏览器页面已关闭且无法恢复: {e2}"
+                ) from e2
+            continue
 
     logger.warning("等待上传就绪超时，继续尝试后续步骤")
     self.page = page
@@ -1199,33 +1393,52 @@ def apply_patches() -> None:
         return _wait_upload_ready_with_progress(self, page, timeout_sec)
 
     def _upload_video_fixed(self, page, video_path):
-        page = ensure_upload_stage(self, page)
-        page = ensure_desktop_layout(self, page)
-        try:
-            _upload_video_via_video_input(self, page, video_path)
-            page = _recover_page_if_closed(self, getattr(self, "page", None) or page)
+        last_err: BaseException | None = None
+        timeout = int(getattr(self, "upload_timeout", 0) or 0) or min(
+            180, int(getattr(self, "content_check_timeout", 180) or 180)
+        )
+        for attempt in range(1, 4):
             try:
-                page.wait_for_timeout(1000)
-            except Exception:
-                page = _recover_page_if_closed(self, page)
-            return _wait_upload_ready_with_progress(
-                self, page, int(getattr(self, "upload_timeout", 0) or 0)
-                or min(180, int(getattr(self, "content_check_timeout", 180) or 180))
-            )
-        except Exception as e:
-            msg = str(e)
-            if "closed" not in msg.lower() and "Target" not in msg:
-                raise
-            logger.warning("上传过程页面关闭，恢复后重试一次: %s", e)
-            page2 = _recover_page_if_closed(self, getattr(self, "page", None))
-            page2 = ensure_upload_stage(self, page2)
-            page2 = ensure_desktop_layout(self, page2)
-            _upload_video_via_video_input(self, page2, video_path)
-            page2 = _recover_page_if_closed(self, getattr(self, "page", None) or page2)
-            return _wait_upload_ready_with_progress(
-                self, page2, int(getattr(self, "upload_timeout", 0) or 0)
-                or min(180, int(getattr(self, "content_check_timeout", 180) or 180))
-            )
+                if attempt == 1:
+                    page = ensure_upload_stage(self, page)
+                    page = ensure_desktop_layout(self, page)
+                else:
+                    logger.warning(
+                        "上传过程页面关闭，恢复后重试 (%s/3): %s",
+                        attempt,
+                        str(last_err).split("\n", 1)[0][:160] if last_err else "",
+                    )
+                    page = _recover_page_if_closed(
+                        self, getattr(self, "page", None), reopen_upload=True
+                    )
+                    page = ensure_upload_stage(self, page)
+                    page = ensure_desktop_layout(self, page)
+                _upload_video_via_video_input(self, page, video_path)
+                page = _recover_page_if_closed(
+                    self, getattr(self, "page", None) or page, reopen_upload=False
+                )
+                try:
+                    page.wait_for_timeout(1000)
+                except Exception as e:
+                    if _is_target_closed_error(e):
+                        page = _recover_page_if_closed(
+                            self, getattr(self, "page", None), reopen_upload=True
+                        )
+                    else:
+                        page = _recover_page_if_closed(self, page)
+                return _wait_upload_ready_with_progress(self, page, timeout)
+            except Exception as e:
+                last_err = e
+                if not _is_target_closed_error(e) and "无法恢复" not in str(e):
+                    raise
+                if attempt >= 3:
+                    break
+                continue
+        raise RuntimeError(
+            f"上传失败：页面/浏览器反复关闭（已重试3次）。"
+            f"请确认比特窗口未被关掉，并检查该窗口 SOCKS 代理。"
+            f" 最后错误: {str(last_err).split(chr(10), 1)[0][:160]}"
+        ) from last_err
 
     def _attach_product_fixed(self, page, product_id, product_display_name=None):
         page = ensure_desktop_layout(self, page)
