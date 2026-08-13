@@ -14,7 +14,10 @@ publish:
   max_replace_attempts: 3
   dry_run: false
   upload_url: https://www.tiktok.com/tiktokstudio/upload?from=creator_center
+  # 挂车展示名的中文底稿。保持默认走内置多语词表；改成别的中文会按品名语种翻译后填入
   product_display_name: 小黄车下单
+  # 点「发布」后等接口确认落地的秒数，超时按失败重试而不是当成功
+  publish_confirm_timeout: 45
 paths:
   videos_dir: C:/Users/Administrator/Desktop/泰国视频（品名）
   mapping_file: data/product_video_map.json
@@ -28,6 +31,12 @@ poll:
   per_ip_group: 5
   parallel_ips: true
   max_parallel_ips: 0
+  # 并发名额不给冷却中的组占：某组在等 IP 冷却时，直接换下一个冷却已到的组来跑
+  fair_group_rotation: true
+  # 每轮开跑前按「本机能开几个窗口」和「实际 IP 组数」校准并发上限
+  auto_parallel: true
+  # 单账号占用时长的初值，仅用于预估单轮时间；跑过几个号后自动改用实测中位数
+  est_seconds_per_account: 75
   account_cooldown_seconds: 21600
   ip_group_cooldown_seconds: 600
   cooldown_jitter_seconds: 60

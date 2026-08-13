@@ -186,7 +186,10 @@ def apply_precheck_hang_patches() -> None:
         code = data.get("code")
         if not ok and code not in (None, 0, "0", 200, "200"):
             raise RuntimeError(f"BitBrowser API 失败: {data}")
-        return data.get("data") if isinstance(data, dict) and "data" in data else data
+        # 必须原样返回整个响应：原版 _post 也是这样，拆 data 这层是各调用方自己做的。
+        # 这里如果先拆一层，list_profiles 会再拆一次（data→data），
+        # 拿到空字典后返回空列表，表现为「比特 API 连通但未获取到任何比特窗口」。
+        return data
 
     def check_agent_fast(self, proxy, timeout=_CHECKAGENT_TIMEOUT):
         return original_check_agent(
@@ -335,11 +338,18 @@ def apply_precheck_hang_patches() -> None:
                     ):
                         return
                 else:
-                    if not messagebox.askyesno(
+                    # 三选一：默认给「跑完等冷却自动接下一轮」，这是最常用的模式
+                    choice = messagebox.askyesnocancel(
                         "确认真实轮询",
-                        "将对所有启用且已就绪的账号真实发布（冷却中的账号会跳过），确定？",
-                    ):
+                        "将对所有启用且已就绪的账号真实发布（冷却中的账号会跳过）。\n\n"
+                        "是：持续轮询——一轮跑完，等账号冷却结束自动接着下一轮，\n"
+                        "　　直到你点「终止后台任务」\n"
+                        "否：只跑一轮就停\n"
+                        "取消：不发布",
+                    )
+                    if choice is None:
                         return
+                    forever = bool(choice)
 
             def job():
                 from publisher import PublisherService

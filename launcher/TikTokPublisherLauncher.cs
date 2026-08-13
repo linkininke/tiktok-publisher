@@ -39,6 +39,10 @@ class TikTokPublisherLauncher
         psi.UseShellExecute = false;
         psi.RedirectStandardOutput = false;
         psi.RedirectStandardError = false;
+        // python.exe 是控制台程序，直接起会弹出一个黑窗口。
+        // CreateNoWindow 只是不显示这个控制台，进程照样有 stdout，
+        // 换成 pythonw.exe 反而会让 sys.stdout 变成 None，print 会直接报错。
+        psi.CreateNoWindow = true;
 
         // 环境变量（与 启动_修复版.bat 一致）
         SetEnv(psi, "PYTHONUTF8", "1");

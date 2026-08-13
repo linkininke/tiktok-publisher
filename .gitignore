@@ -8,6 +8,7 @@ _internal/
 _tools/
 TikTokPublisher.exe
 TikTokPublisher_original.exe
+TikTokPublisher.prev.exe
 *.pyc
 __pycache__/
 
@@ -32,6 +33,11 @@ Desktop.ini
 *.7z
 MinGit/
 _pack_stage/
+
+# 临时排查脚本与探针输出（_probe_*.py / _cart.txt 之类，跑完即删）
+_probe_*.py
+_sim*.py
+_zipcheck.txt
 
 config.yaml
 

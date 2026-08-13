@@ -489,6 +489,122 @@ def _save_overview_quick(app) -> None:
         logger.warning("快捷设置保存失败: %s", e)
 
 
+# 常用操作按钮分两行：上行是跑任务，下行是检查和清理
+_OPS_ROW_RUN = ("多号干跑", "多号真实发布", "持续运行", "终止后台任务")
+_OPS_ROW_AUX = ("代理体检", "重新检测网络", "清理草稿", "清理冷却缓存", "删除视频日志")
+# 两行按钮数不同，用 20 列（4 和 5 的公倍数）让每行各自等宽且左右对齐
+_OPS_COLS = 20
+
+
+def _arrange_quick_actions(bar, ctk) -> None:
+    """把挤成一长条的常用操作按钮改成两行等宽排列。
+
+    9 个按钮 pack 在同一行会超出窗口宽度，右边几个直接看不见。
+    """
+    buttons = [w for w in bar.winfo_children() if isinstance(w, ctk.CTkButton)]
+    if not buttons:
+        return
+    by_text = {}
+    for w in buttons:
+        by_text.setdefault(_widget_text(w), w)
+
+    run = [by_text[t] for t in _OPS_ROW_RUN if t in by_text]
+    aux = [by_text[t] for t in _OPS_ROW_AUX if t in by_text]
+    placed = set(run) | set(aux)
+    aux += [w for w in buttons if w not in placed]
+    if not run or not aux:
+        return
+
+    for w in buttons:
+        try:
+            w.pack_forget()
+        except Exception:
+            pass
+    for c in range(_OPS_COLS):
+        try:
+            bar.grid_columnconfigure(c, weight=1, uniform="ops")
+        except Exception:
+            pass
+
+    for row, group, height in ((0, run, 40), (1, aux, 34)):
+        span = max(1, _OPS_COLS // len(group))
+        for i, w in enumerate(group):
+            try:
+                w.configure(width=110, height=height)
+            except Exception:
+                pass
+            try:
+                w.grid(
+                    row=row,
+                    column=i * span,
+                    columnspan=span,
+                    sticky="ew",
+                    padx=(0 if i == 0 else 8, 0),
+                    pady=(0 if row == 0 else 10, 0),
+                )
+            except Exception:
+                pass
+
+
+def _relayout_overview(body, app, ctk, panel) -> None:
+    """总览重排：常用操作和快捷设置提到最上面，状态卡片下移。
+
+    原顺序是 6 张状态卡片占满首屏，最常点的按钮反而要滚动才看得到。
+    """
+    net = getattr(app, "_ov_net", None)
+    ops_bar = foot_bar = tip = None
+    cards = []
+    for w in body.winfo_children():
+        if w is panel or w is net:
+            continue
+        texts = [_widget_text(x) for x in _iter_descendants(w)]
+        if isinstance(w, ctk.CTkLabel):
+            if any(t.startswith("提示") for t in texts):
+                tip = w
+            continue
+        if any(t == "常用操作" for t in texts):
+            ops_bar = w
+            continue
+        if any(t == "刷新状态" for t in texts):
+            foot_bar = w
+            continue
+        try:
+            info = w.grid_info() or {}
+            cards.append((int(info.get("row", 0)), int(info.get("column", 0)), w))
+        except Exception:
+            continue
+
+    if ops_bar is None:
+        # 认不出原布局就别乱动，至少把快捷设置挂上去
+        panel.grid(row=99, column=0, columnspan=2, sticky="ew", padx=7, pady=(10, 6))
+        return
+
+    def place(widget, row, **kw):
+        if widget is None:
+            return
+        opts = dict(column=0, columnspan=2, sticky="ew", padx=7)
+        opts.update(kw)
+        try:
+            widget.grid(row=row, **opts)
+        except Exception:
+            pass
+
+    place(ops_bar, 0, pady=(0, 12))
+    place(panel, 1, pady=(0, 12))
+    place(net, 2, sticky="w", padx=10, pady=(0, 10))
+
+    cards.sort(key=lambda x: (x[0], x[1]))
+    for i, (_, col, w) in enumerate(cards):
+        try:
+            w.grid(row=3 + i // 2, column=col, columnspan=1, sticky="nsew", padx=7, pady=7)
+        except Exception:
+            pass
+
+    base = 3 + (len(cards) + 1) // 2
+    place(foot_bar, base, pady=(16, 0))
+    place(tip, base + 1, sticky="w", padx=10, pady=(16, 0))
+
+
 def _enhance_overview_ux(app, ctk, ui_app) -> None:
     """总览：插入「快捷设置」+ 把高频按钮排到前面。"""
     frames = getattr(app, "_frames", {}) or {}
@@ -502,21 +618,8 @@ def _enhance_overview_ux(app, ctk, ui_app) -> None:
     fonts = getattr(ui_app, "FONTS", {})
     colors = getattr(ui_app, "COLORS", {})
 
-    # 在「网络预检」下方插入快捷设置（把后续行下移）
-    insert_at = 3
-    try:
-        net = getattr(app, "_ov_net", None)
-        if net is not None:
-            info = net.grid_info() or {}
-            if info.get("row") is not None:
-                insert_at = int(info["row"]) + 1
-    except Exception:
-        insert_at = 3
-
-    _shift_grid_from_row(body, insert_at, 2)
-
+    # 先建面板，具体排在第几行由本函数末尾的 _relayout_overview 统一决定
     panel = ctk.CTkFrame(body, fg_color=colors.get("surface", "#1a2220"), corner_radius=12)
-    panel.grid(row=insert_at, column=0, columnspan=2, sticky="ew", padx=6, pady=(10, 6))
     try:
         panel.grid_columnconfigure(1, weight=1)
         panel.grid_columnconfigure(3, weight=1)
@@ -728,24 +831,20 @@ def _enhance_overview_ux(app, ctk, ui_app) -> None:
             )
             del_log_btn.pack(side="left", padx=(10, 0), before=stop_btn)
             app._ov_deleted_videos_btn = del_log_btn
+            _arrange_quick_actions(stop_btn.master, ctk)
     except Exception as e:
         logger.warning("总览「清理草稿」按钮未加上: %s", e)
 
-    # 高频按钮视觉强调：只改 CTkButton 本体。
+    _relayout_overview(body, app, ctk, panel)
+
+    # 高频按钮视觉强调：只改字体，高度交给 _arrange_quick_actions 统一，
+    # 否则同一行的按钮会一高一矮。
     # 切勿对按钮内部 Label 调 height——CTkLabel.height 会把按钮撑到上百像素。
     try:
         for w in _iter_descendants(body):
-            if not isinstance(w, ctk.CTkButton):
-                continue
-            txt = _widget_text(w)
-            if txt == "多号真实发布":
+            if isinstance(w, ctk.CTkButton) and _widget_text(w) == "多号真实发布":
                 try:
-                    w.configure(height=40, font=fonts.get("body"))
-                except Exception:
-                    pass
-            elif txt == "终止后台任务":
-                try:
-                    w.configure(height=36)
+                    w.configure(font=fonts.get("body"))
                 except Exception:
                     pass
     except Exception:

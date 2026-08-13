@@ -115,7 +115,7 @@ def test_replace_loop_destroys_on_fail() -> None:
     # monkeypatch destroy
     import fix_post_ai_check as mod
 
-    def fake_destroy(pid, video):
+    def fake_destroy(pid, video, **kwargs):
         destroyed.append(Path(video).name)
         Path(video).unlink(missing_ok=True)
 
