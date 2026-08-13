@@ -132,6 +132,7 @@ def main() -> None:
     from fix_group_rotation import apply_group_rotation_patches
     from fix_video_tab import apply_video_tab_patches
     from fix_scheduler import apply_scheduler_patches
+    from fix_dashboard import apply_dashboard_patches
 
     apply_patches()
     apply_sync_excel_patches()
@@ -168,6 +169,8 @@ def main() -> None:
     apply_video_tab_patches()
     # 放在所有 UI 补丁之后：它也包了 __init__ 和 _build_settings
     apply_scheduler_patches()
+    # 数据看板：只读发布记录，必须在 incident_ui 之后（它把 NAV_ITEMS 换成了 tuple）
+    apply_dashboard_patches()
 
     from ui.app import main as ui_main
 
