@@ -30,10 +30,13 @@ poll:
   rounds_per_day: 2
   per_ip_group: 5
   parallel_ips: true
+  # 同时跑几个 IP 组。填正数就固定按它跑，不会被下面的 auto_parallel 改掉；
+  # 填 0 = 交给 auto_parallel 按机器估算自动定
   max_parallel_ips: 0
   # 并发名额不给冷却中的组占：某组在等 IP 冷却时，直接换下一个冷却已到的组来跑
   fair_group_rotation: true
-  # 每轮开跑前按「本机能开几个窗口」和「实际 IP 组数」校准并发上限
+  # 仅在 max_parallel_ips 填 0 时生效：按「本机能开几个窗口」和「实际 IP 组数」自动定并发。
+  # 估算只按核数和内存套公式，机器实际跑不到就把 max_parallel_ips 填成你要的数
   auto_parallel: true
   # 单账号占用时长的初值，仅用于预估单轮时间；跑过几个号后自动改用实测中位数
   est_seconds_per_account: 75

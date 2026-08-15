@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import struct
 import sys
 import time
 import zipfile
@@ -51,6 +53,115 @@ ACCOUNTS_TEMPLATE = """# 比特浏览器窗口 ↔ TikTok 账号列表
 accounts: []
 """
 
+# 扩展模块(.pyd)加载时只搜自身目录，不会搜父目录；MSVCP140 等在 _internal/ 根下
+# 而 greenlet 在子目录里，裸 Windows 会 ImportError: _greenlet DLL load failed。
+RUNTIME_DLLS = {
+    "msvcp140.dll",
+    "msvcp140_1.dll",
+    "vcruntime140_1.dll",
+}
+# vcruntime140.dll 进程启动时由 python311.dll 载入，无需逐个目录复制
+SKIP_RUNTIME = {"vcruntime140.dll"}
+RUNTIME_SOURCES = {
+    "msvcp140.dll": ROOT / "_internal" / "MSVCP140.dll",
+    "vcruntime140.dll": ROOT / "_tools" / "py311" / "vcruntime140.dll",
+    "vcruntime140_1.dll": ROOT / "_tools" / "py311" / "vcruntime140_1.dll",
+}
+SYS32 = Path(r"C:\Windows\System32")
+
+
+def _imported_dlls(path: Path) -> set[str]:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return set()
+    if data[:2] != b"MZ":
+        return set()
+    pe = struct.unpack_from("<I", data, 0x3C)[0]
+    if data[pe:pe + 4] != b"PE\0\0":
+        return set()
+    nsec = struct.unpack_from("<H", data, pe + 6)[0]
+    opt_size = struct.unpack_from("<H", data, pe + 20)[0]
+    opt_off = pe + 24
+    magic = struct.unpack_from("<H", data, opt_off)[0]
+    dd_off = opt_off + (112 if magic == 0x20B else 96)
+    imp_rva = struct.unpack_from("<I", data, dd_off + 8)[0]
+    if not imp_rva:
+        return set()
+    sections = []
+    sec_off = opt_off + opt_size
+    for i in range(nsec):
+        o = sec_off + i * 40
+        vaddr, vsize = struct.unpack_from("<II", data, o + 12)
+        rawsize, raw = struct.unpack_from("<II", data, o + 16)
+        sections.append((vaddr, vsize, raw, rawsize))
+
+    def rva2off(rva):
+        for vaddr, vsize, raw, rawsize in sections:
+            if vaddr <= rva < vaddr + max(vsize, rawsize):
+                return raw + (rva - vaddr)
+        return None
+
+    out = set()
+    off = rva2off(imp_rva)
+    if off is None:
+        return out
+    while True:
+        entry = data[off:off + 20]
+        if len(entry) < 20 or entry == b"\0" * 20:
+            break
+        name_rva = struct.unpack_from("<I", entry, 12)[0]
+        if name_rva:
+            no = rva2off(name_rva)
+            if no is not None:
+                out.add(data[no:data.index(b"\0", no)].decode("ascii", "ignore").lower())
+        off += 20
+    return out
+
+
+def _runtime_source(dll: str) -> Path | None:
+    src = RUNTIME_SOURCES.get(dll)
+    if src and src.is_file():
+        return src
+    fallback = SYS32 / dll
+    return fallback if fallback.is_file() else None
+
+
+def ensure_runtime_dlls() -> int:
+    """把 VC++ 运行库放到每个需要它的 .pyd 旁边，返回新复制的文件数。"""
+    want: dict[Path, set[str]] = {}
+    for base in (ROOT / "_internal", ROOT / "_tools" / "runtime_site"):
+        if not base.is_dir():
+            continue
+        for p in base.rglob("*"):
+            if p.suffix.lower() not in (".pyd", ".dll") or not p.is_file():
+                continue
+            for d in _imported_dlls(p) & RUNTIME_DLLS:
+                if d in SKIP_RUNTIME or (p.parent / d).exists():
+                    continue
+                want.setdefault(p.parent, set()).add(d)
+
+    copied = 0
+    pending = dict(want)
+    while pending:
+        nxt: dict[Path, set[str]] = {}
+        for d, dlls in pending.items():
+            for dll in sorted(dlls):
+                dst = d / dll
+                if dst.exists():
+                    continue
+                src = _runtime_source(dll)
+                if src is None:
+                    print(f"  警告：找不到 {dll}，无法补齐 {dst.relative_to(ROOT)}")
+                    continue
+                shutil.copy2(src, dst)
+                copied += 1
+                for sub in _imported_dlls(dst) & RUNTIME_DLLS:
+                    if sub not in SKIP_RUNTIME and not (d / sub).exists():
+                        nxt.setdefault(d, set()).add(sub)
+        pending = nxt
+    return copied
+
 
 def walk(base: Path):
     for p in sorted(base.rglob("*")):
@@ -67,6 +178,10 @@ def main() -> None:
         for m in missing:
             print("  -", m)
         raise SystemExit(1)
+
+    n_dll = ensure_runtime_dlls()
+    if n_dll:
+        print(f"  已补齐 VC++ 运行库 {n_dll} 个（greenlet 等扩展模块在裸 Windows 可启动）")
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
     if OUT.exists():

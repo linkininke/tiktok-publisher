@@ -21,8 +21,11 @@
 * 预估本轮时长，并指出瓶颈是「最大组的冷却链」还是「机器并发不够」；
 * 组大小不均时告警——单轮时长只由最大的组决定，跟总账号数无关。100 个号里只要有
   一组塞了 15 个，整轮就会被它从 41 分钟拖到 141 分钟，而其余组早就闲着；
-* 并发上限按「本机能开几个窗口」和「实际组数」校准：低了就提上去（否则白等），
-  高了或设成不限就压下来（否则内存爆掉反而更慢）。
+* poll.max_parallel_ips 填 0 时，按「本机能开几个窗口」和「实际组数」自动填一个。
+
+并发上限以手填的为准：机器估算只是按核数和内存套的公式，没算硬盘、上行带宽和比特
+自身开销，实测不少机器跑不到估出来的数。所以 poll.max_parallel_ips 一旦填了正数就
+照着跑，自动校准不会再改它（比估算高只告警）；只有填 0 才交给自动。
 """
 
 from __future__ import annotations
@@ -305,39 +308,84 @@ def _estimate_round_minutes(counts: list[int], workers: int, t_sec: float, c_sec
     return (chain + queue) / 60.0, "最大组的冷却链（%s 个号一条 IP）" % n_max
 
 
-def _tune_parallel(svc, group_count: int) -> int:
-    """把并发上限校准到 min(本机能力, 组数)。返回本轮实际生效的并发数。"""
+def _manual_cap(svc) -> int:
+    """用户手填的并发上限，0 表示留给自动校准。
+
+    只认 config 里的值：自动校准会把算出来的数写回 svc.max_parallel_ips，
+    再从属性读就分不清「用户填的 2」和「上一轮自动算出来的 4」了。
+    """
     cfg = getattr(svc, "cfg", None)
     poll = (cfg.get("poll") or {}) if isinstance(cfg, dict) else {}
-    configured = int(getattr(svc, "max_parallel_ips", 0) or 0)
-    effective = group_count if configured <= 0 else min(configured, group_count)
-    if poll.get("auto_parallel") is False:
+    raw = poll.get("max_parallel_ips")
+    if raw is None:  # 老配置里没这个键，只能退回属性
+        raw = getattr(svc, "max_parallel_ips", 0)
+    try:
+        return max(0, int(float(raw or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _tune_parallel(svc, group_count: int) -> int:
+    """定下本轮的并发数。返回实际生效的并发数。
+
+    手填的值说了算。_machine_cap() 只是按核数和内存套公式，没算硬盘、上行带宽和比特
+    自身开销，不少机器实际跑不到那个数，所以填了就照着跑，绝不替用户改大。
+    只有留 0（=自动）时才用机器估算去填。
+    """
+    cfg = getattr(svc, "cfg", None)
+    poll = (cfg.get("poll") or {}) if isinstance(cfg, dict) else {}
+    manual = _manual_cap(svc)
+
+    if manual > 0:
+        # 上一轮自动校准可能把属性改过，这里改回手填值，run_round 才会按它开线程池
+        svc.max_parallel_ips = manual
+        effective = min(manual, group_count)
+        cap, why = _machine_cap()
+        if manual > cap:
+            logger.warning(
+                "[体检] 并发上限 %s（手动设置，按你设的跑）| 机器估算只建议 %s（%s）。"
+                "要是单号耗时明显变长或窗口卡，调小到 %s 再试",
+                manual,
+                cap,
+                why,
+                cap,
+            )
+        elif effective < manual:
+            logger.info(
+                "[体检] 并发上限 %s（手动设置）| 只有 %s 个 IP 组，本轮同时跑 %s 组",
+                manual,
+                group_count,
+                effective,
+            )
+        else:
+            logger.info(
+                "[体检] 并发上限 %s（手动设置）| %s 个 IP 组 → 本轮同时跑 %s 组%s",
+                manual,
+                group_count,
+                effective,
+                "；机器估算还能撑 %s，想更快可以往上调" % cap if manual < cap else "",
+            )
         return effective
+
+    if poll.get("auto_parallel") is False:
+        logger.info(
+            "[体检] 并发上限 不限（并行上限填 0 且已关自动校准）→ %s 个 IP 组全开。"
+            "机器扛不住就在「并行 IP 上限」填个数字",
+            group_count,
+        )
+        return group_count
 
     cap, why = _machine_cap()
     target = max(1, min(cap, group_count))
-    if effective == target:
-        return effective
-
     svc.max_parallel_ips = target
-    if effective < target:
-        logger.info(
-            "[体检] 并发上限 %s → %s：本机可撑 %s 个窗口（%s），当前 %s 个 IP 组，提上去能少等",
-            configured or "不限",
-            target,
-            cap,
-            why,
-            group_count,
-        )
-    else:
-        logger.warning(
-            "[体检] 并发上限 %s → %s：本机只撑得住 %s 个窗口（%s）。开太多会抢内存和上行带宽，"
-            "单账号耗时变长反而更慢",
-            configured or "不限",
-            target,
-            cap,
-            why,
-        )
+    logger.info(
+        "[体检] 并发上限 自动 → %s：本机估算可撑 %s 个窗口（%s），当前 %s 个 IP 组。"
+        "想固定下来就在「并行 IP 上限」填数字，填了就不再自动改",
+        target,
+        cap,
+        why,
+        group_count,
+    )
     return target
 
 

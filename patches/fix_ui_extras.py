@@ -636,7 +636,7 @@ def _enhance_overview_ux(app, ctk, ui_app) -> None:
 
     ctk.CTkLabel(
         panel,
-        text="改完点「保存快捷设置」。多 IP 并行=不同出口同时跑；上限 0=不限制。",
+        text="改完点「保存快捷设置」。多 IP 并行=不同出口同时跑；上限填数字就固定用它，0=自动。",
         font=fonts.get("small"),
         text_color=colors.get("muted", "#888"),
         anchor="w",
@@ -1059,7 +1059,7 @@ def _promote_settings_common(app, ctk, ui_app) -> None:
             for child in list(scroll.winfo_children()):
                 info = child.grid_info() or {}
                 if int(info.get("row", -1)) == row and int(info.get("column", -1)) == 2:
-                    child.configure(text="0=不限制；也可在总览点「按性能推荐」")
+                    child.configure(text="填数字=固定用它，不会被自动改；0=按机器估算自动定")
                     break
         except Exception:
             pass
@@ -1078,7 +1078,7 @@ def _promote_settings_common(app, ctk, ui_app) -> None:
             ).pack(side="left")
             ctk.CTkLabel(
                 rec_row,
-                text="按 CPU/内存估算，并受当前 IP 组数封顶",
+                text="只是按 CPU/内存估的上限值，机器跑不动就自己往小填",
                 font=fonts.get("small"),
                 text_color=colors.get("muted", "#888"),
                 anchor="w",

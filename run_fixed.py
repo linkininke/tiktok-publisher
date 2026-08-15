@@ -177,5 +177,50 @@ def main() -> None:
     ui_main()
 
 
+def _report_fatal(exc: BaseException) -> None:
+    """把启动失败的原因摆到用户面前。
+
+    TikTokPublisher.exe 用 CreateNoWindow 起 python，控制台是隐藏的：不弹窗的话
+    任何启动异常都表现为「双击没反应」，客户机上完全无从查起。
+    """
+    import traceback
+
+    text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    print(text, file=sys.stderr)
+    try:
+        logging.getLogger("publisher").critical("启动失败\n%s", text)
+    except Exception:
+        pass
+
+    crash_file = ""
+    try:
+        log_dir = Path(__file__).resolve().parent / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        target = log_dir / "startup_error.txt"
+        target.write_text(text, encoding="utf-8")
+        crash_file = str(target)
+    except Exception:
+        pass
+
+    try:
+        import ctypes
+
+        tail = f"\n\n完整堆栈：{crash_file}" if crash_file else ""
+        ctypes.windll.user32.MessageBoxW(
+            None,
+            f"程序启动失败，请把这段发给开发者：\n\n{type(exc).__name__}: {exc}{tail}",
+            "TikTokPublisher 启动失败",
+            0x10,  # MB_ICONERROR
+        )
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as _e:
+        _report_fatal(_e)
+        sys.exit(1)
