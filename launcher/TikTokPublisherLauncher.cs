@@ -54,11 +54,11 @@ class TikTokPublisherLauncher
         SetEnv(psi, "TCL_LIBRARY", Path.Combine(root, "_internal", "_tcl_data"));
         SetEnv(psi, "TK_LIBRARY", Path.Combine(root, "_internal", "_tk_data"));
 
-        // 本机 7890 代理可用才注入
-        if (TcpOpen("127.0.0.1", 7890, 300))
+        // 本机 7892 代理可用才注入（蓝海加速器等常见混合端口）
+        if (TcpOpen("127.0.0.1", 7892, 300))
         {
-            SetEnv(psi, "HTTP_PROXY", "http://127.0.0.1:7890");
-            SetEnv(psi, "HTTPS_PROXY", "http://127.0.0.1:7890");
+            SetEnv(psi, "HTTP_PROXY", "http://127.0.0.1:7892");
+            SetEnv(psi, "HTTPS_PROXY", "http://127.0.0.1:7892");
         }
 
         try

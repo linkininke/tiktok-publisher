@@ -13,7 +13,7 @@ _LANG_CHOICES = []  # 保留占位，语种已改为始终跟随 Excel 品名
 _MODE_CHOICES = []
 
 # 本机机场默认端口（用户当前环境）
-_DEFAULT_PROXY_PORT = "6850"
+_DEFAULT_PROXY_PORT = "7892"
 
 
 def _find_scrollable(widget):
@@ -124,17 +124,17 @@ def _norm_proxy_port(raw: str) -> str:
     # 只填端口
     if s.isdigit():
         return f"http://127.0.0.1:{s}"
-    # :7890
+    # :7892
     if re.match(r"^:\d+$", s):
         return f"http://127.0.0.1{s}"
-    # 127.0.0.1:7890
+    # 127.0.0.1:7892
     if re.match(r"^[\w\.-]+:\d+$", s):
         return f"http://{s}"
-    # 已是 URL，但可能被写成 http://127.0.0.1::7890
+    # 已是 URL，但可能被写成 http://127.0.0.1::7892
     if "://" in s:
         s = re.sub(r"(://[^/:]+):+(\d+)", r"\1:\2", s)
         return s
-    # 7890 混入其它字符时尽量抽出端口
+    # 7892 混入其它字符时尽量抽出端口
     m = re.search(r"(\d{2,5})$", s)
     if m and s.replace(m.group(1), "").strip(":/.") in ("", "127.0.0.1", "localhost"):
         return f"http://127.0.0.1:{m.group(1)}"
