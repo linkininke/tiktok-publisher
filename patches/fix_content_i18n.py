@@ -64,43 +64,45 @@ LANG_LABELS: dict[str, str] = {
     "ru": "Русский",
 }
 
+# 这些指令在提示词里的位置比下面的标签配比要求更靠前。以前每条都写着
+# 「可含 #TikTokShop #fyp」，等于一边要求最多 1 条泛标签、一边点名推荐泛标签，
+# 模型自然照着更靠前的那句办。所以这里只管语种和口吻，标签规则统一交给配比要求。
 _LANG_INSTRUCTIONS: dict[str, str] = {
     "en": (
         "Write ALL 5 titles in English for TikTok Shop. "
-        "Hashtags in English or common tags (#TikTokShop #fyp). "
-        "May mention yellow cart / shop now naturally."
+        "Hashtags in English. May mention yellow cart / shop now naturally."
     ),
     "zh": (
         "5 条标题全部用简体中文，面向 TikTok Shop 橱窗带货；"
-        "可自然提到小黄车/去购买。标签用中文或通用话题（可含 #TikTokShop #fyp）。"
+        "可自然提到小黄车/去购买。标签用中文。"
     ),
     "th": (
         "เขียนชื่อเรื่องทั้ง 5 เป็นภาษาไทย สำหรับ TikTok Shop "
         "น้ำเสียงพูดคุย ชวนกดตะกร้าเหลือง/สั่งซื้อ "
-        "แฮชแท็กเป็นภาษาไทยหรือสากล (#TikTokShop #fyp ได้)"
+        "แฮชแท็กเป็นภาษาไทย"
     ),
     "id": (
         "Tulis 5 judul dalam Bahasa Indonesia untuk TikTok Shop. "
-        "Ajakan beli via keranjang kuning. Hashtag Indonesia/umum (#TikTokShop #fyp ok)."
+        "Ajakan beli via keranjang kuning. Hashtag Bahasa Indonesia."
     ),
     "vi": (
         "Viết cả 5 tiêu đề bằng tiếng Việt cho TikTok Shop. "
-        "Kêu gọi mua qua giỏ vàng. Hashtag tiếng Việt/quốc tế (#TikTokShop #fyp được)."
+        "Kêu gọi mua qua giỏ vàng. Hashtag tiếng Việt."
     ),
     "ms": (
         "Tulis 5 tajuk dalam Bahasa Melayu untuk TikTok Shop. "
-        "Galakkan beli melalui troli kuning. Hashtag Melayu/umum."
+        "Galakkan beli melalui troli kuning. Hashtag Bahasa Melayu."
     ),
     "ja": (
         "タイトル5本はすべて日本語。TikTok Shop向け、黄色カート誘導可。"
-        "ハッシュタグは日本語または一般タグ。"
+        "ハッシュタグは日本語。"
     ),
     "ko": (
-        "제목 5개는 모두 한국어. 틱톡샵/노란 카트 유도 가능. 해시태그는 한국어 또는 공통 태그."
+        "제목 5개는 모두 한국어. 틱톡샵/노란 카트 유도 가능. 해시태그는 한국어."
     ),
     "ru": (
         "Все 5 заголовков на русском для TikTok Shop. "
-        "Можно упомянуть жёлтую корзину. Хэштеги на русском или общие."
+        "Можно упомянуть жёлтую корзину. Хэштеги на русском."
     ),
 }
 
@@ -357,6 +359,231 @@ def get_cart_display_for_product(product_id: str, fallback: str | None = None) -
     return final
 
 
+# 太宽的标签：作品数动辄千万上亿，进的是所有人的大池子，带不来会下单的人。
+# 真机实测的作品数：#TikTokShop 1.5 亿、#Singapore 1010 万、#MustHave 400 万。
+_GENERIC_TAGS = {
+    "fyp", "fypシ", "fypage", "fypdongggggggg", "foryou", "foryoupage",
+    "foryourpage", "viral", "viralvideo", "viraltiktok", "trending", "trend",
+    "tiktok", "tiktokviral", "musthave", "musthaves", "explore", "explorepage",
+    "xyzbca", "capcut", "duet", "tiktokmademebuyit", "tiktokfinds",
+    # 光国名和光 TikTokShop 没有购买意图，换成 #tiktokshopsingapore 这类才有
+    "tiktokshop", "singapore", "sgtiktok",
+}
+_CAPTION_TAG_RE = re.compile(r"#[^\s#]+")
+
+
+def required_tags() -> list[str]:
+    """每条视频都必须带的标签，由 content_gen.REQUIRED_HASHTAGS 定（#tiktok #fyp）。
+
+    这两条是刻意保留的泛标签，不能被下面的裁剪当成占名额的杂标签删掉。
+    """
+    try:
+        import content_gen
+
+        return [str(t) for t in (getattr(content_gen, "REQUIRED_HASHTAGS", ()) or ())]
+    except Exception:
+        return ["#tiktok", "#fyp"]
+
+
+def too_broad_tags() -> set[str]:
+    """太宽的标签（不含必带的 #tiktok #fyp），给上传端选词时排除用。"""
+    return set(_GENERIC_TAGS) - {t.lstrip("#").lower() for t in required_tags()}
+
+
+def trim_generic_tags(caption: str) -> str:
+    """删掉太宽的标签，但必带标签和精准标签一条不动。"""
+    keep = {t.lstrip("#").lower() for t in required_tags()}
+    dropped: list[str] = []
+
+    def repl(m: "re.Match[str]") -> str:
+        body = m.group(0).lstrip("#").lower()
+        if body in keep or body not in _GENERIC_TAGS:
+            return m.group(0)
+        dropped.append(m.group(0))
+        return ""
+
+    out = _CAPTION_TAG_RE.sub(repl, caption or "")
+    if not dropped:
+        return caption
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    out = "\n".join(line.rstrip() for line in out.split("\n"))
+    logger.info("去掉太宽的标签 %s（必带 %s 保留）", dropped, sorted(keep))
+    return out.strip()
+
+
+# ---------------- 种子词：给面板用的查询词，不是最终标签 ----------------
+# 让模型凭空说 5 条精准热门标签它做不到（实测只会给 #TikTokShop #Singapore
+# 这种安全牌）；但「这个品名属于哪个品类、什么属性、什么场景」是抽取题，
+# 它做得很稳。真实标签一律由 Studio 的联想面板提供，那里每条都带真实作品数。
+SEED_COUNT = 6
+SEED_TOKENS = 4096
+_SEEDS_BY_PRODUCT: dict[str, list[str]] = {}
+_SEED_LOCK = threading.Lock()
+_SEED_DISK_LOADED = False
+_SEED_DISK: dict[str, list[str]] = {}
+_SEED_FAILED: set[str] = set()
+_WORD_RE = re.compile(r"[0-9A-Za-z\u00c0-\uffff]+")
+
+
+def _seed_cache_file():
+    from pathlib import Path
+
+    try:
+        import config_loader
+
+        root = Path(getattr(config_loader, "ROOT", None) or ".")
+    except Exception:
+        root = Path(__file__).resolve().parent.parent
+    return root / "data" / "seed_words_cache.json"
+
+
+def _load_seed_disk() -> None:
+    global _SEED_DISK_LOADED
+    if _SEED_DISK_LOADED:
+        return
+    _SEED_DISK_LOADED = True
+    try:
+        import json
+
+        p = _seed_cache_file()
+        if p.is_file():
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    if isinstance(v, list):
+                        _SEED_DISK[str(k)] = [str(x) for x in v if str(x).strip()]
+    except Exception as e:
+        logger.debug("种子词缓存读取跳过: %s", e)
+
+
+def _save_seed_disk() -> None:
+    try:
+        import json
+
+        p = _seed_cache_file()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(
+            json.dumps(_SEED_DISK, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except Exception as e:
+        logger.debug("种子词缓存落盘跳过: %s", e)
+
+
+def seeds_from_name(product_name: str) -> list[str]:
+    """接口不可用时的兜底：直接把品名切成词。
+
+    「Mamee Monster snack」→ mameemonster / mamee / monster / snack，
+    虽然不含场景人群，但至少是贴着这个品的词，比泛标签强。
+    """
+    words = [w.lower() for w in _WORD_RE.findall(product_name or "") if len(w) > 1]
+    out: list[str] = []
+    if len(words) >= 2:
+        out.append("".join(words[:2]))
+    for w in words:
+        if w not in out:
+            out.append(w)
+    return out[:SEED_COUNT]
+
+
+def _seed_prompt(product_name: str, lang: str) -> str:
+    lang_name = LANG_LABELS.get(lang, lang)
+    return f"""从商品名提取用于在 TikTok 里搜话题的种子词。这是抽取任务，不要创作。
+
+商品名：{product_name}
+
+输出 {SEED_COUNT} 个词，按这个结构：
+- 2 个品类词：一个尽量具体，一个稍宽一档
+- 2 个属性词：口味 / 材质 / 规格 / 品牌
+- 2 个场景或人群词：什么时候吃用、谁会买
+
+每个词必须是一个连写的小写词：不带 #，不带空格、连字符和标点。
+语言为 {lang_name}（code={lang}），与商品名语种一致。
+只输出 JSON（不要 markdown）：{{"seeds":["w1","w2","w3","w4","w5","w6"]}}
+"""
+
+
+def _ask_seed_words(gen, product_name: str, lang: str) -> list[str]:
+    client = getattr(gen, "_client", None)
+    if client is None:
+        return []
+    import json
+
+    resp = client.chat.completions.create(
+        model=getattr(gen, "model", None) or "deepseek-v4-flash",
+        messages=[
+            {"role": "system", "content": "你做关键词抽取，只输出合法 JSON。"},
+            {"role": "user", "content": _seed_prompt(product_name, lang)},
+        ],
+        max_tokens=SEED_TOKENS,
+        extra_body={"thinking": {"type": "disabled"}},
+    )
+    text = str(resp.choices[0].message.content or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    l, r = text.find("{"), text.rfind("}")
+    if l >= 0 and r > l:
+        text = text[l : r + 1]
+    raw = json.loads(text).get("seeds") or []
+    out: list[str] = []
+    for item in raw:
+        w = "".join(_WORD_RE.findall(str(item))).lower()
+        if w and w not in out:
+            out.append(w)
+    return out[:SEED_COUNT]
+
+
+def resolve_seed_words(gen, product_id: str, product_name: str, lang: str) -> list[str]:
+    """拿这个商品的种子词，一个商品只问一次接口。"""
+    key = f"{product_id}||{lang}"
+    with _SEED_LOCK:
+        _load_seed_disk()
+        hit = _SEED_DISK.get(key)
+        if hit:
+            _SEEDS_BY_PRODUCT[key] = list(hit)
+            return list(hit)
+        failed = key in _SEED_FAILED
+    if not failed:
+        try:
+            seeds = _ask_seed_words(gen, product_name, lang)
+        except Exception as e:
+            seeds = []
+            logger.warning("种子词抽取失败，退回品名切词: %s", e)
+        if seeds:
+            with _SEED_LOCK:
+                _SEED_DISK[key] = list(seeds)
+                _SEEDS_BY_PRODUCT[key] = list(seeds)
+                _save_seed_disk()
+            logger.info("种子词 %s → %s", (product_name or "")[:30], seeds)
+            return seeds
+        with _SEED_LOCK:
+            _SEED_FAILED.add(key)
+    fallback = seeds_from_name(product_name)
+    logger.info("种子词用品名切词 %s → %s", (product_name or "")[:30], fallback)
+    return fallback
+
+
+def remember_seed_words(product_id: str, seeds: list[str], lang: str) -> None:
+    if not seeds:
+        return
+    with _SEED_LOCK:
+        _SEEDS_BY_PRODUCT[f"{product_id}||{lang}"] = list(seeds)
+        _SEEDS_BY_PRODUCT[str(product_id)] = list(seeds)
+
+
+def seed_words_for(product_id: str) -> list[str]:
+    """供上传流程读取本商品的种子词（发布 loop 不传这个字段）。"""
+    with _SEED_LOCK:
+        got = _SEEDS_BY_PRODUCT.get(str(product_id))
+        if got:
+            return list(got)
+        for k, v in _SEEDS_BY_PRODUCT.items():
+            if k.startswith(f"{product_id}||") and v:
+                return list(v)
+    return []
+
+
 def build_prompt_for_lang(product_name: str, selling_points: str, keywords: str, lang: str) -> str:
     lang = normalize_lang(lang)
     instr = _LANG_INSTRUCTIONS.get(lang, _LANG_INSTRUCTIONS["en"])
@@ -374,7 +601,14 @@ def build_prompt_for_lang(product_name: str, selling_points: str, keywords: str,
 {instr}
 另外：
 1) 每条标题不超过 100 个字符，标题里不要写 hashtag。
-2) 5 条热门标签带 #，尽量像当前热门搜索词，可含 #TikTokShop #fyp，但必须和商品相关，且整体语言与标题一致。
+2) 5 条标签带 #，整体语言与标题一致，每条必须是一个连写的词：
+   # 后面不能有空格、连字符、点号或标点，例如写 #tiktokshopsingapore，不能写 #tiktok shop singapore。
+   按精准到宽的顺序排（排在后面的会被截掉），配比：
+   - 前 3 条紧贴商品本身：品类、口味/材质/规格、使用场景或人群，例如 #koreanramyun #spicynoodles #midnightsnack
+   - 第 4 条地区购物场景，例如 #tiktokshopsingapore #sgfoodie
+   - 第 5 条可以宽一点，但仍要和商品沾边
+   下面这些一条都不要写，系统会另外补：#fyp #foryou #viral #trending #tiktok #musthave #explore
+   也不要写光秃秃的 #TikTokShop 或光国名 #Singapore，它们有上千万条作品，没有购买意图。
 3) 只根据商品名写，不要假设看过视频。
 4) 从 5 条标题里选出最适合的一条放入 best_title（必须与 titles 中某条完全一致）。
 5) 严格输出 JSON（不要 markdown）：
@@ -409,10 +643,20 @@ def apply_content_i18n_patches() -> None:
             cart,
         )
 
+        seeds = resolve_seed_words(self, str(product_id), product_name or "", lang)
+
         old_prompt = getattr(content_gen, "PROMPT_TEMPLATE", "")
         content_gen.PROMPT_TEMPLATE = build_prompt_for_lang(
             "{product_name}", "{selling_points}", "{keywords}", lang
         )
+        # _finalize_tags 里 n_others = hashtag_count - len(REQUIRED_HASHTAGS)。
+        # hashtag_count 是 5、必带占 2，AI 写的 5 条就只有前 3 条能活下来，
+        # 后两条（往往正是贴商品的那两条）被直接截掉。把必带的份额加回去。
+        old_count = getattr(self, "hashtag_count", 5)
+        try:
+            self.hashtag_count = int(old_count) + len(required_tags())
+        except Exception:
+            pass
 
         system_msg = (
             f"你是 TikTok Shop 橱窗带货文案专家（目标语言：{lang_name}/{lang}）。"
@@ -450,7 +694,20 @@ def apply_content_i18n_patches() -> None:
             if isinstance(result, dict):
                 result["language"] = lang
                 result["product_display_name"] = cart
+                trimmed = trim_generic_tags(str(result.get("caption") or ""))
+                if trimmed:
+                    result["caption"] = trimmed
+                tags = result.get("hashtags")
+                if isinstance(tags, list):
+                    keep = {t.lstrip("#").lower() for t in required_tags()}
+                    result["hashtags"] = [
+                        t
+                        for t in tags
+                        if str(t).lstrip("#").lower() in keep
+                        or str(t).lstrip("#").lower() not in _GENERIC_TAGS
+                    ]
                 remember_cart_display(str(product_id), cart, lang)
+                remember_seed_words(str(product_id), seeds, lang)
                 logger.info(
                     "文案语种=%s | 小黄车「%s」| caption前80=%s",
                     lang,
@@ -460,6 +717,7 @@ def apply_content_i18n_patches() -> None:
             return result
         finally:
             content_gen.PROMPT_TEMPLATE = old_prompt
+            self.hashtag_count = old_count
             if real_create is not None:
                 try:
                     completions.create = real_create

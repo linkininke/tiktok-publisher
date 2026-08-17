@@ -55,8 +55,21 @@ content:
   language: en
   language_mode: auto_product
   title_max_chars: 100
+  # hashtag_count 是给模型的标签数；content_gen 里 REQUIRED_HASHTAGS
+  # (#tiktok #fyp) 会额外占名额，程序已自动把这份加回去，不用手填大
   hashtag_count: 5
   extra_hashtags: []
+  # 标签从 Studio 联想面板的真实候选里选（每条都带真实作品数），不靠模型凭空想。
+  # 设成 false 退回「用模型给的标签」的老行为
+  tag_panel_probe: true
+  precise_tag_count: 5
+  # 作品数区间：太宽的进大池子带不来下单的人，太窄的没人搜
+  tag_min_posts: 50000
+  tag_max_posts: 3000000
+  tag_target_posts: 300000
+  # 目标市场，如 singapore / malaysia / thailand。
+  # 填了才允许带该地区的标签；留空则任何带地区的标签都不用，免得跨国送流量
+  market: singapore
 scheduler:
   round1:
     hour: 10

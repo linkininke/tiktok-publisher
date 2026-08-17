@@ -334,8 +334,27 @@ class _PostWatch:
         try:
             if req.method == "POST" and _PUBLISH_API.search(str(req.url)):
                 self.sent.append(str(req.url))
+                self._log_text_extra(req)
         except Exception:
             pass
+
+    def _log_text_extra(self, req) -> None:
+        """提交体里到底带没带话题实体。
+
+        话题在手机端能不能点、能不能进话题流，取决于提交体里的 text_extra。
+        描述框里显示成蓝字不代表提交时带上了，这里是唯一能证实的地方。
+        """
+        try:
+            body = req.post_data or ""
+        except Exception:
+            return
+        if not body:
+            return
+        names = re.findall(r'"hashtag_name"\s*:\s*"([^"]{1,60})"', body)
+        if names:
+            logger.info("提交体带话题实体 %s 个: %s", len(names), names[:8])
+        elif '"text_extra"' in body:
+            logger.warning("提交体 text_extra 里没有话题实体，发出去的话题点不动")
 
     def _on_failed(self, req):
         try:
