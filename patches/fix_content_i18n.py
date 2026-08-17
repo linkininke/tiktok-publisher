@@ -473,15 +473,17 @@ def _save_seed_disk() -> None:
 def seeds_from_name(product_name: str) -> list[str]:
     """接口不可用时的兜底：直接把品名切成词。
 
-    「Mamee Monster snack」→ mameemonster / mamee / monster / snack，
-    虽然不含场景人群，但至少是贴着这个品的词，比泛标签强。
+    「Mamee Monster snack」→ mameemonster / mamee / snack。
+    机械切词切不出品牌和品类的区别，而短的品牌碎片是最坏的种子词：
+    面板是纯前缀匹配，「Encik Guan Black Coffee」切出的 guan 会撞出 #guangzhou。
+    所以这条路径只收 5 个字符以上的词。模型给的种子词已经是语义结果，不受此限。
     """
     words = [w.lower() for w in _WORD_RE.findall(product_name or "") if len(w) > 1]
     out: list[str] = []
     if len(words) >= 2:
         out.append("".join(words[:2]))
     for w in words:
-        if w not in out:
+        if len(w) >= 5 and w not in out:
             out.append(w)
     return out[:SEED_COUNT]
 
@@ -494,9 +496,11 @@ def _seed_prompt(product_name: str, lang: str) -> str:
 
 输出 {SEED_COUNT} 个词，按这个结构：
 - 2 个品类词：一个尽量具体，一个稍宽一档
-- 2 个属性词：口味 / 材质 / 规格 / 品牌
+- 2 个属性词：口味 / 材质 / 规格
 - 2 个场景或人群词：什么时候吃用、谁会买
 
+不要输出品牌名和品牌名的片段。这些词会被拿去搜话题库，而搜索是按前缀匹配的：
+品牌片段会撞出毫不相关的热门词（Encik Guan 的 guan 会撞出 guangzhou）。
 每个词必须是一个连写的小写词：不带 #，不带空格、连字符和标点。
 语言为 {lang_name}（code={lang}），与商品名语种一致。
 只输出 JSON（不要 markdown）：{{"seeds":["w1","w2","w3","w4","w5","w6"]}}
@@ -582,6 +586,103 @@ def seed_words_for(product_id: str) -> list[str]:
             if k.startswith(f"{product_id}||") and v:
                 return list(v)
     return []
+
+
+# ---------------- 相关性把关：热度归面板，相关性归模型 ----------------
+# 面板只会前缀匹配，撞出的杂词用字符串规则挡不住：coffee→coffeelover 是对的、
+# guan→guangzhou 是错的，两者在字符层面是同一种关系，只有语义能区分。
+# 所以最后一道让模型判：它不知道哪个标签多热（那是面板的活），但很清楚
+# 一款咖啡不该挂 #guangzhou。
+RELEVANT_TOKENS = 4096
+_HELPER_GEN = None
+_HELPER_LOCK = threading.Lock()
+
+
+def _helper_gen():
+    """给上传流程用的模型客户端。
+
+    上传器手里没有 ContentGenerator 实例，而它的构造只读环境变量，
+    单独建一个最省事，也不会影响发布流程里那个。
+    """
+    global _HELPER_GEN
+    with _HELPER_LOCK:
+        if _HELPER_GEN is None:
+            import content_gen
+
+            _HELPER_GEN = content_gen.ContentGenerator()
+        return _HELPER_GEN
+
+
+def _relevant_prompt(product_name: str, rows: list, count: int, lang: str) -> str:
+    lang_name = LANG_LABELS.get(lang, lang)
+    listed = "\n".join(
+        f"{i + 1}. #{t} （{v} 条作品）" for i, (t, v) in enumerate(rows)
+    )
+    return f"""下面是 TikTok 话题库里搜到的候选标签，请挑出真正和这个商品相关的 {count} 条。
+
+商品：{product_name}
+商品语种：{lang_name}（code={lang}）
+
+候选（只能从这里面挑，不许自己造词）：
+{listed}
+
+挑选规则：
+1) 必须和这个商品本身相关：品类、口味/材质/规格、使用场景或会买的人群。
+2) 剔掉只是拼写像、意思不相关的词。这批候选是按前缀匹配搜出来的，
+   夹着城市名、人名、其他品类的热词，例如一款咖啡的候选里出现 #guangzhou，
+   那只是因为品牌名片段 guan 是 guangzhou 的前缀，必须剔掉。
+3) 剔掉谁都在刷的大池子词（#fyp #viral #musthave 之类）。
+4) 相关的不够 {count} 条就少给几条，不要凑数。
+5) 按相关度从高到低排。
+
+只输出 JSON（不要 markdown）：{{"tags":["#a","#b"]}}
+"""
+
+
+def pick_relevant_tags(
+    product_name: str, rows: list, count: int, lang: str = "en"
+) -> list[str]:
+    """让模型从面板候选里挑真正相关的几条。
+
+    rows: [(标签, 作品数)]，标签不带 #。
+    只返回确实在候选里的标签；失败返回空，由调用方退回按作品数选。
+    """
+    if not rows:
+        return []
+    import json
+
+    gen = _helper_gen()
+    client = getattr(gen, "_client", None)
+    if client is None:
+        logger.info("没有可用的模型客户端，标签相关性把关跳过")
+        return []
+    resp = client.chat.completions.create(
+        model=getattr(gen, "model", None) or "deepseek-v4-flash",
+        messages=[
+            {"role": "system", "content": "你做标签筛选，只输出合法 JSON。"},
+            {
+                "role": "user",
+                "content": _relevant_prompt(product_name, rows, count, lang),
+            },
+        ],
+        max_tokens=RELEVANT_TOKENS,
+        extra_body={"thinking": {"type": "disabled"}},
+    )
+    text = str(resp.choices[0].message.content or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    l, r = text.find("{"), text.rfind("}")
+    if l >= 0 and r > l:
+        text = text[l : r + 1]
+    allowed = {str(t).lower(): str(t) for t, _v in rows}
+    out: list[str] = []
+    for item in json.loads(text).get("tags") or []:
+        body = str(item).lstrip("#").strip().lower()
+        # 模型偶尔会自己造词或改写，只认确实在候选里的
+        if body in allowed and f"#{body}" not in out:
+            out.append(f"#{body}")
+    return out[:count]
 
 
 def build_prompt_for_lang(product_name: str, selling_points: str, keywords: str, lang: str) -> str:

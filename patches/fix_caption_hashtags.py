@@ -428,6 +428,14 @@ _REGION_NAMES = {
     "japan", "korea", "taiwan", "china", "india", "australia", "america",
     "brasil", "brazil", "mexico", "espana",
 }
+# 城市名是前缀撞词的重灾区：品名「Encik Guan Black Coffee」切出的种子词 guan
+# 是 guangzhou 的前缀，面板就把这个千万级的城市标签推上来了。
+_CITY_NAMES = {
+    "guangzhou", "shenzhen", "shanghai", "beijing", "hangzhou", "chengdu",
+    "hongkong", "macau", "taipei", "seoul", "tokyo", "osaka", "bangkok",
+    "jakarta", "surabaya", "kualalumpur", "penang", "johor", "manila",
+    "hanoi", "saigon", "dubai", "london", "newyork", "sydney", "melbourne",
+}
 # #tiktokshopth / #tiktokshopmy 这类两字母后缀：短代码不能当子串匹配
 # （#myfood 里的 my 不是马来西亚），只在这个固定前缀下认。
 _SHOP_REGION_RE = re.compile(r"^tiktokshop([a-z]{2})$")
@@ -490,12 +498,12 @@ def _too_broad() -> set[str]:
 
 
 def tag_region(tag: str) -> str:
-    """标签里带的地区，认不出返回空。"""
+    """标签里带的国家或城市，认不出返回空。"""
     body = str(tag).lstrip("#").lower()
     m = _SHOP_REGION_RE.match(body)
     if m:
         return _CODE_TO_REGION.get(m.group(1), "")
-    for name in _REGION_NAMES:
+    for name in _REGION_NAMES | _CITY_NAMES:
         if name in body:
             return name
     return ""
@@ -511,19 +519,20 @@ def is_wrong_region(tag: str, market: str) -> bool:
     return bool(region) and region != str(market or "").strip().lower()
 
 
-def select_precise_tags(
+def shortlist_tags(
     pool: dict,
     *,
-    count: int,
     min_posts: int,
     max_posts: int,
     target_posts: int,
     market: str = "",
     exclude=(),
-) -> list[str]:
-    """从面板候选池里挑精准标签。
+    limit: int = 40,
+) -> list[tuple[str, int, str]]:
+    """按作品数区间、地区、太宽名单过一遍，得到候选短名单。
 
     pool: {标签: {"views": 作品数, "seed": 来自哪个种子词}}
+    返回 [(标签, 作品数, 种子词)]，按离目标档位的远近排好。
     作品数按数量级比较：5 万到 300 万之间差 60 倍，线性距离没意义。
     """
     ban = {str(t).lstrip("#").lower() for t in exclude} | _too_broad()
@@ -539,14 +548,36 @@ def select_precise_tags(
             continue
         seed = str((info or {}).get("seed") or "").lower()
         # 面板是按词匹配返回的，正常候选一定和种子词互为子串。
-        # 不设这道就会把 #singaporetamil 这种只是碰巧同前缀的词当成精准标签。
+        # 但这道只能挡掉完全无关的行，挡不住前缀撞词：coffee→coffeelover 是对的、
+        # guan→guangzhou 是错的，字符层面是同一种关系。后者交给模型判语义。
         if seed and body != seed and seed not in body and body not in seed:
             continue
         cands.append((body, views, seed))
     lt = math.log10(max(int(target_posts), 1))
     # 离目标档位越近越好；同档优先更长的（更具体）
     cands.sort(key=lambda c: (abs(math.log10(max(c[1], 1)) - lt), -len(c[0])))
+    return cands[:limit]
 
+
+def select_precise_tags(
+    pool: dict,
+    *,
+    count: int,
+    min_posts: int,
+    max_posts: int,
+    target_posts: int,
+    market: str = "",
+    exclude=(),
+) -> list[str]:
+    """只按作品数挑精准标签，模型把关不可用时的退路。"""
+    cands = shortlist_tags(
+        pool,
+        min_posts=min_posts,
+        max_posts=max_posts,
+        target_posts=target_posts,
+        market=market,
+        exclude=exclude,
+    )
     out: list[str] = []
     per_seed: dict[str, int] = {}
     for body, _views, seed in cands:
@@ -726,16 +757,16 @@ def _resolve_tags(page, loc, ai_tags: list, ctx: dict) -> tuple[list, str]:
         logger.info("没有种子词，标签沿用模型输出 product=%s", pid or "-")
         return fallback, "ai(无种子词)"
     pool = build_tag_pool(page, loc, seeds, f"{pid}||{cfg['market'] or 'nomarket'}")
-    picked = select_precise_tags(
-        pool,
-        count=int(cfg["count"]),
+    count = int(cfg["count"])
+    bands = dict(
         min_posts=int(cfg["min_posts"]),
         max_posts=int(cfg["max_posts"]),
         target_posts=int(cfg["target_posts"]),
         market=str(cfg["market"]),
         exclude=required,
     )
-    if not picked:
+    short = shortlist_tags(pool, **bands)
+    if not short:
         logger.warning(
             "候选池 %s 条里没有落在 %s~%s 作品数区间的，标签沿用模型输出",
             len(pool),
@@ -743,17 +774,44 @@ def _resolve_tags(page, loc, ai_tags: list, ctx: dict) -> tuple[list, str]:
             cfg["max_posts"],
         )
         return fallback, "ai(区间内无候选)"
+
+    # 面板给热度，模型判相关性：字符串规则区分不了 coffee→coffeelover（对）
+    # 和 guan→guangzhou（错），只有语义能。
+    picked, how = [], "panel"
+    pname = str((ctx or {}).get("product_name") or "") or pid
+    try:
+        import fix_content_i18n
+
+        picked = fix_content_i18n.pick_relevant_tags(
+            pname,
+            [(t, v) for t, v, _s in short],
+            count,
+            fix_content_i18n.detect_lang_from_text(pname),
+        )
+    except Exception as e:
+        logger.warning("标签相关性把关失败，退回只按作品数选: %s", e)
+    if picked:
+        dropped = [f"#{t}" for t, _v, _s in short[:count] if f"#{t}" not in picked]
+        if dropped:
+            logger.info("相关性把关剔掉了 %s", dropped)
+    else:
+        picked = select_precise_tags(pool, count=count, **bands)
+        how = "panel(未过相关性)"
+        logger.info("相关性把关没给出结果，改按作品数选")
+    if not picked:
+        return fallback, "ai(区间内无候选)"
     ctx["pool_size"] = len(pool)
     ctx["picked_precise"] = picked
     logger.info(
-        "精准标签取自面板 %s（池 %s 条，区间 %s~%s）+ 必带 %s",
+        "精准标签取自面板 %s（池 %s 条→短名单 %s 条，区间 %s~%s）+ 必带 %s",
         picked,
         len(pool),
+        len(short),
         cfg["min_posts"],
         cfg["max_posts"],
         required,
     )
-    return _dedup_tags(picked + required), "panel"
+    return _dedup_tags(picked + required), how
 
 
 def _click_suggestion(page, hit: dict) -> bool:
